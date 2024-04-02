@@ -49,8 +49,13 @@ use crate::{
         input::InputEvent,
         renderer::{
             gles::{GlesError, GlesRenderer},
+            vulkan::{
+                VulkanRenderer,
+                Error as VkRendererError,
+            },
             Bind,
         },
+        vulkan,
     },
     utils::{Physical, Rectangle, Size},
 };
@@ -74,6 +79,86 @@ where
             .with_title("Smithay")
             .with_visible(true),
     )
+}
+
+#[derive(Debug)]
+pub struct WinitVulkanBackend {
+    pub window: Arc<WinitWindow>,
+    pub renderer: VulkanRenderer,
+    pub instance: vulkan::Instance,
+    pub physical_device: vulkan::PhysicalDevice,
+    pub surface: vulkan::Surface,
+}
+
+impl TryFrom<Arc<WinitWindow>> for WinitVulkanBackend {
+    type Error = Box<dyn std::error::Error>;
+    fn try_from(window: Arc<WinitWindow>) -> Result<Self, Self::Error> {
+        let (instance, phd, surface) = {
+            // TODO: app_info
+            let (instance, surface) = vulkan::Instance::with_window(None, &window)?;
+            let (phd, _caps) = vulkan::PhysicalDevice::enumerate(&instance)?
+                .find_map(|phd| {
+                    let props = unsafe {
+                        surface.extension().get_physical_device_surface_capabilities(
+                            phd.handle(),
+                            surface.handle(),
+                        )
+                    }.ok()?;
+                    Some((phd, props))
+                })
+                .ok_or("Failed to select physical device")?;
+            (instance, phd, surface)
+        };
+
+        let renderer = VulkanRenderer::new(&phd)?;
+        Ok(WinitVulkanBackend {
+            window,
+            renderer,
+            instance,
+            physical_device: phd,
+            surface,
+        })
+    }
+}
+
+pub fn init_vk(
+    builder: WindowBuilder,
+) -> Result<(WinitVulkanBackend, WinitEventLoop), Error> {
+    let span = info_span!("backend_winit", window = tracing::field::Empty);
+    let _guard = span.enter();
+    info!("Initializing a winit backend");
+
+    let event_loop = EventLoopBuilder::new()
+        .build()
+        .map_err(Error::EventLoopCreation)?;
+
+    let window = Arc::new(builder.build(&event_loop).map_err(Error::WindowCreation)?);
+
+    span.record("window", Into::<u64>::into(window.id()));
+    debug!("Window created");
+
+    let gfx = WinitVulkanBackend::try_from(window.clone())
+        .map_err(Error::Surface)?;
+
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
+
+    drop(_guard);
+
+    Ok((
+        gfx,
+        WinitEventLoop {
+            scale_factor: window.scale_factor(),
+            start_time: Instant::now(),
+            key_counter: 0,
+            fake_token: None,
+            event_loop,
+            window,
+            pending_events: Vec::new(),
+            is_x11: false, // TODO
+            span,
+        },
+    ))
 }
 
 /// Create a new [`WinitGraphicsBackend`], which implements the [`Renderer`]
@@ -231,6 +316,18 @@ pub enum Error {
     /// Renderer initialization failed.
     #[error("Renderer creation failed: {0}")]
     RendererCreationError(#[from] GlesError),
+    #[error("Vulkan Renderer creation falied: {0}")]
+    VkRendererCreation(#[from] VkRendererError<'static>),
+}
+
+impl Error {
+    #[inline(always)]
+    fn surface<E>(e: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error>>,
+    {
+        Error::Surface(e.into())
+    }
 }
 
 /// Window with an active EGL Context created by `winit`.
