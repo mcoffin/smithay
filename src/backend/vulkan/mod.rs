@@ -73,6 +73,7 @@ use std::{
 
 use ash::{
     extensions::ext::DebugUtils,
+    extensions::khr::Surface as VkSurface,
     prelude::VkResult,
     vk::{self, PhysicalDeviceDriverProperties, PhysicalDeviceDrmPropertiesEXT},
     Entry,
@@ -89,6 +90,11 @@ use self::{inner::InstanceInner, version::Version};
 #[cfg(feature = "backend_drm")]
 use super::drm::DrmNode;
 
+pub mod native;
+mod surface;
+pub mod util;
+use native::TryVulkanNativeWindow;
+pub use surface::Surface;
 mod inner;
 mod phd;
 
@@ -98,7 +104,7 @@ static LIBRARY: Lazy<Result<Entry, LoadError>> =
     Lazy::new(|| unsafe { Entry::load().map_err(|_| LoadError) });
 
 /// Error loading the Vulkan library
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("Failed to load the Vulkan library")]
 pub struct LoadError;
 
@@ -116,6 +122,9 @@ pub enum InstanceError {
     /// Vulkan API error.
     #[error(transparent)]
     Vk(#[from] vk::Result),
+
+    #[error("failed to get native handles for display/window")]
+    Window,
 }
 
 /// Error returned when a physical device property is not supported
@@ -164,6 +173,27 @@ impl Instance {
     /// Creates a new [`Instance`].
     pub fn new(max_version: Version, app_info: Option<AppInfo>) -> Result<Instance, InstanceError> {
         unsafe { Self::with_extensions(max_version, app_info, &[]) }
+    }
+
+    /// Creates a new [`Instance`] based on the requirements of a given native window
+    ///
+    /// # Safety
+    ///
+    /// * Safe as long as [`VulkanNativeWindow::required_extensions`] follows the rules outlined
+    ///   in [`Instance::with_extensions`]
+    pub fn with_window<W>(app_info: Option<AppInfo>, window: &W) -> Result<(Instance, Surface), InstanceError>
+    where
+        W: TryVulkanNativeWindow,
+    {
+        let window = window.vulkan_native_window().ok_or(InstanceError::Window)?;
+        let instance =
+            unsafe { Self::with_extensions(Version::VERSION_1_3, app_info, window.required_extensions()) }?;
+        let entry: &ash::Entry = LIBRARY.as_ref().map_err(|&e| e)?;
+        let surface_ext = VkSurface::new(entry, instance.handle());
+        let surface = window
+            .create_surface(entry, instance.handle())
+            .map(|surface| Surface::new(surface_ext, surface))?;
+        Ok((instance, surface))
     }
 
     /// Creates a new [`Instance`] with some additionally specified extensions.
@@ -217,8 +247,7 @@ impl Instance {
 
         // Enable debug layers if present and debug assertions are enabled.
         if cfg!(debug_assertions) {
-            const VALIDATION: &CStr =
-                unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") };
+            const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
             if available_layers
                 .iter()
@@ -725,7 +754,9 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
             vk::DebugUtilsMessageSeverityFlagsEXT::INFO => info!(ty, "{}", message),
             vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => warn!(ty, "{}", message),
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => error!(ty, "{}", message),
-            _ => (),
+            _ => {
+                panic!("unknown debug message severity: {:?}", message_severity);
+            }
         }
     });
 

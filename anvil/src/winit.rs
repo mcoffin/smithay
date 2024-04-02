@@ -14,14 +14,17 @@ use smithay::{
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
+        drm::DrmNode,
         egl::EGLDevice,
         renderer::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::AsRenderElements,
             gles::GlesRenderer,
-            ImportDma, ImportMemWl,
+            Bind, ImportDma, ImportDmaWl, ImportMemWl, Renderer
         },
-        winit::{self, WinitEvent, WinitGraphicsBackend},
+        winit::{
+            self, Error as WinitError, WinitEglGraphics, WinitEvent, WinitEventLoop, WinitGraphics, WinitGraphicsBackend
+        },
         SwapBuffersError,
     },
     delegate_dmabuf,
@@ -33,26 +36,29 @@ use smithay::{
     reexports::{
         calloop::EventLoop,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
-        wayland_server::{protocol::wl_surface, Display},
+        wayland_server::{protocol::wl_surface, Display, GlobalDispatch},
         winit::platform::pump_events::PumpStatus,
+        wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
     },
     utils::{IsAlive, Scale, Transform},
     wayland::{
         compositor,
         dmabuf::{
-            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufGlobalData, DmabufHandler, DmabufState, ImportNotifier
         },
     },
 };
-use tracing::{error, info, warn};
+#[cfg(feature = "renderer_vulkan")]
+use smithay::backend::winit::WinitVulkanGraphics;
+use tracing::*;
 
 use crate::state::{post_repaint, take_presentation_feedback, AnvilState, Backend};
 use crate::{drawing::*, render::*};
 
 pub const OUTPUT_NAME: &str = "winit";
 
-pub struct WinitData {
-    backend: WinitGraphicsBackend<GlesRenderer>,
+pub struct WinitData<G: WinitGraphics> {
+    backend: WinitGraphicsBackend<G>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     full_redraw: u8,
@@ -60,28 +66,42 @@ pub struct WinitData {
     pub fps: fps_ticker::Fps,
 }
 
-impl DmabufHandler for AnvilState<WinitData> {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.backend_data.dmabuf_state.0
-    }
+type WinitDataGles = WinitData<WinitEglGraphics<GlesRenderer>>;
+#[cfg(feature = "renderer_vulkan")]
+type WinitDataVulkan = WinitData<WinitVulkanGraphics>;
+macro_rules! dmabuf_delegate {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl DmabufHandler for AnvilState<$t>
+            {
+                fn dmabuf_state(&mut self) -> &mut DmabufState {
+                    &mut self.backend_data.dmabuf_state.0
+                }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        if self
-            .backend_data
-            .backend
-            .renderer()
-            .import_dmabuf(&dmabuf, None)
-            .is_ok()
-        {
-            let _ = notifier.successful::<AnvilState<WinitData>>();
-        } else {
-            notifier.failed();
-        }
-    }
+                fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+                    if self
+                        .backend_data
+                        .backend
+                        .renderer()
+                        .import_dmabuf(&dmabuf, None)
+                        .is_ok()
+                    {
+                        let _ = notifier.successful::<AnvilState<$t>>();
+                    } else {
+                        notifier.failed();
+                    }
+                }
+            }
+        )+
+        delegate_dmabuf!($(AnvilState<$t>),+);
+    };
 }
-delegate_dmabuf!(AnvilState<WinitData>);
+#[cfg(feature = "renderer_vulkan")]
+dmabuf_delegate!(WinitDataGles, WinitDataVulkan);
+#[cfg(not(feature = "renderer_vulkan"))]
+dmabuf_delegate!(WinitDataGles);
 
-impl Backend for WinitData {
+impl<G: WinitGraphics> Backend for WinitData<G> {
     fn seat_name(&self) -> String {
         String::from("winit")
     }
@@ -92,13 +112,24 @@ impl Backend for WinitData {
     fn update_led_state(&mut self, _led_state: LedState) {}
 }
 
-pub fn run_winit() {
+type WinitInitFn<G> = fn() -> Result<(WinitGraphicsBackend<G>, WinitEventLoop), WinitError>;
+
+#[tracing::instrument(skip_all, name = "winit_loop")]
+fn run_winit<G>(init_fn: WinitInitFn<G>) 
+where
+    G: WinitGraphics + 'static,
+    <G as WinitGraphics>::Renderer: ImportDmaWl + ImportMemWl + ImportEgl + Bind<<G as WinitGraphics>::Surface>,
+    <G as WinitGraphics>::Surface: Clone,
+    <<G as WinitGraphics>::Renderer as Renderer>::TextureId: Clone,
+    WinitGraphicsBackend<G>: WinitBackendExt,
+    AnvilState<WinitData<G>>: DmabufHandler + GlobalDispatch<ZwpLinuxDmabufV1, DmabufGlobalData>,
+{
     let mut event_loop = EventLoop::try_new().unwrap();
     let display = Display::new().unwrap();
     let mut display_handle = display.handle();
 
     #[cfg_attr(not(feature = "egl"), allow(unused_mut))]
-    let (mut backend, mut winit) = match winit::init::<GlesRenderer>() {
+    let (mut backend, mut winit) = match init_fn() {
         Ok(ret) => ret,
         Err(err) => {
             error!("Failed to initialize Winit backend: {}", err);
@@ -120,7 +151,7 @@ pub fn run_winit() {
             model: "Winit".into(),
         },
     );
-    let _global = output.create_global::<AnvilState<WinitData>>(&display.handle());
+    let _global = output.create_global::<AnvilState<WinitData<G>>>(&display.handle());
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
@@ -142,8 +173,7 @@ pub fn run_winit() {
     #[cfg(feature = "debug")]
     let mut fps_element = FpsElement::new(fps_texture);
 
-    let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
-        .and_then(|device| device.try_get_render_node());
+    let render_node = backend.drm_node();
 
     let dmabuf_default_feedback = match render_node {
         Ok(Some(node)) => {
@@ -167,7 +197,7 @@ pub fn run_winit() {
     // Note: egl on Mesa requires either v4 or wl_drm (initialized with bind_wl_display)
     let dmabuf_state = if let Some(default_feedback) = dmabuf_default_feedback {
         let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<AnvilState<WinitData>>(
+        let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<AnvilState<WinitData<G>>>(
             &display.handle(),
             &default_feedback,
         );
@@ -176,7 +206,7 @@ pub fn run_winit() {
         let dmabuf_formats = backend.renderer().dmabuf_formats().collect::<Vec<_>>();
         let mut dmabuf_state = DmabufState::new();
         let dmabuf_global =
-            dmabuf_state.create_global::<AnvilState<WinitData>>(&display.handle(), dmabuf_formats);
+            dmabuf_state.create_global::<AnvilState<WinitData<G>>>(&display.handle(), dmabuf_formats);
         (dmabuf_state, dmabuf_global, None)
     };
 
@@ -211,21 +241,27 @@ pub fn run_winit() {
     let mut pointer_element = PointerElement::default();
 
     while state.running.load(Ordering::SeqCst) {
-        let status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { size, .. } => {
-                // We only have one output
-                let output = state.space.outputs().next().unwrap().clone();
-                state.space.map_output(&output, (0, 0));
-                let mode = Mode {
-                    size,
-                    refresh: 60_000,
-                };
-                output.change_current_state(Some(mode), None, None, None);
-                output.set_preferred(mode);
-                crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+        let status = winit.dispatch_new_events(|event| {
+            trace!(?event, "got winit event");
+            match event {
+                WinitEvent::Resized { size, .. } => {
+                    // We only have one output
+                    let output = state.space.outputs().next().unwrap().clone();
+                    state.space.map_output(&output, (0, 0));
+                    let mode = Mode {
+                        size,
+                        refresh: 60_000,
+                    };
+                    output.change_current_state(Some(mode), None, None, None);
+                    output.set_preferred(mode);
+                    crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+                }
+                WinitEvent::Input(event) =>
+                    state.process_input_event_windowed(event, OUTPUT_NAME),
+                WinitEvent::CloseRequested =>
+                    state.running.store(false, Ordering::SeqCst),
+                _ => (),
             }
-            WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
-            _ => (),
         });
 
         if let PumpStatus::Exit(_) = status {
@@ -282,7 +318,9 @@ pub fn run_winit() {
 
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
-            let render_res = backend.bind().and_then(|_| {
+            let render_res = backend.bind(|e| {
+                SwapBuffersError::ContextLost(e.to_string().into())
+            }).and_then(|_| {
                 #[cfg(feature = "debug")]
                 if let Some(renderdoc) = renderdoc.as_mut() {
                     renderdoc.start_frame_capture(
@@ -308,14 +346,14 @@ pub fn run_winit() {
 
                 let renderer = backend.renderer();
 
-                let mut elements = Vec::<CustomRenderElements<GlesRenderer>>::new();
+                let mut elements = Vec::<CustomRenderElements<<G as WinitGraphics>::Renderer>>::new();
 
                 elements.extend(pointer_element.render_elements(renderer, cursor_pos_scaled, scale, 1.0));
 
                 // draw the dnd icon if any
                 if let Some(surface) = dnd_icon {
                     if surface.alive() {
-                        elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
+                        elements.extend(AsRenderElements::<<G as WinitGraphics>::Renderer>::render_elements(
                             &smithay::desktop::space::SurfaceTree::from_surface(surface),
                             renderer,
                             cursor_pos_scaled,
@@ -338,7 +376,10 @@ pub fn run_winit() {
                     show_window_preview,
                 )
                 .map_err(|err| match err {
-                    OutputDamageTrackerError::Rendering(err) => err.into(),
+                    // OutputDamageTrackerError::Rendering(err) => err.into(),
+                    OutputDamageTrackerError::Rendering(err) => {
+                        SwapBuffersError::ContextLost(err.to_string().into())
+                    },
                     _ => unreachable!(),
                 })
             });
@@ -427,5 +468,36 @@ pub fn run_winit() {
 
         #[cfg(feature = "debug")]
         state.backend_data.fps.tick();
+    }
+}
+
+pub fn run_winit_gles() {
+    run_winit::<WinitEglGraphics<GlesRenderer>>(winit::init);
+}
+
+#[cfg(feature = "renderer_vulkan")]
+pub fn run_winit_vulkan() {
+    run_winit::<WinitVulkanGraphics>(smithay::backend::winit::init_vulkan);
+}
+
+pub(crate) trait WinitBackendExt {
+    fn drm_node(&mut self) -> Result<Option<DrmNode>, WinitError>;
+}
+
+impl WinitBackendExt for WinitGraphicsBackend<WinitEglGraphics<GlesRenderer>> {
+    fn drm_node(&mut self) -> Result<Option<DrmNode>, WinitError> {
+        EGLDevice::device_for_display(self.renderer().egl_context().display())
+            .and_then(|device| device.try_get_render_node())
+            .map_err(WinitError::from)
+    }
+}
+
+impl WinitBackendExt for WinitGraphicsBackend<WinitVulkanGraphics> {
+    fn drm_node(&mut self) -> Result<Option<DrmNode>, WinitError> {
+        let pd = self.graphics.physical_device();
+        if let ret @ Ok(Some(..)) = pd.render_node().map_err(|_| WinitError::NotSupported) {
+            return ret;
+        }
+        pd.primary_node().map_err(|_| WinitError::NotSupported)
     }
 }

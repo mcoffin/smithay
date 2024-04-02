@@ -23,7 +23,18 @@ use smithay::{
     utils::{Buffer, Logical, Rectangle, Size, Transform},
 };
 
-pub static CLEAR_COLOR: [f32; 4] = [0.8, 0.8, 0.9, 1.0];
+// smithay default
+// pub static CLEAR_COLOR: [f32; 4] = [0.8, 0.8, 0.9, 1.0];
+
+// mcoffin brown (linear) (working w/ SRGB target)
+// pub static CLEAR_COLOR: [f32; 4] = [0.01681, 0.01298, 0.00913, 1.0];
+
+// mcoffin brown (non-linear sRGB) (broken w/ SRGB target)
+// pub static CLEAR_COLOR: [f32; 4] = [0.13725491, 0.11764706, 0.09411765, 1.0];
+
+// porsche green
+pub static CLEAR_COLOR: [f32; 4] = [0.651, 0.78, 0.604, 1.0];
+
 pub static CLEAR_COLOR_FULLSCREEN: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
 pub struct PointerElement {

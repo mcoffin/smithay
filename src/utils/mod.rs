@@ -28,6 +28,8 @@ pub use serial::*;
 mod clock;
 pub use clock::*;
 
+pub mod macros;
+
 /// This resource is not managed by Smithay
 #[derive(Debug)]
 pub struct UnmanagedResource;
