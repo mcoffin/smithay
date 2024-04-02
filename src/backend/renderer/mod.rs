@@ -28,6 +28,9 @@ pub mod glow;
 #[cfg(feature = "renderer_pixman")]
 pub mod pixman;
 
+#[cfg(feature = "renderer_vulkan")]
+pub mod vulkan;
+
 use crate::backend::allocator::{dmabuf::Dmabuf, Format, Fourcc};
 #[cfg(all(
     feature = "wayland_frontend",
