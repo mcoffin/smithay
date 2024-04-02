@@ -210,6 +210,8 @@ impl Renderer for VulkanRenderer {
         _output_size: Size<i32, Physical>,
         _dst_transform: Transform
     ) -> Result<Self::Frame<'_>, Self::Error> {
+        let _target = self.target.as_ref()
+            .ok_or(Error::NoTarget)?;
         todo!()
     }
 }
@@ -668,6 +670,8 @@ pub enum Error<'a> {
     Dmabuf(#[from] dmabuf::DmabufError),
     #[error("failed to convert import format: {0:?}")]
     UnknownFormat(DrmFormat),
+    #[error("no render target bound")]
+    NoTarget,
 }
 
 impl<'a> Error<'a> {
