@@ -169,7 +169,7 @@ pub struct WinitMouseInputEvent {
     pub(crate) time: u64,
     pub(crate) button: WinitMouseButton,
     pub(crate) state: ElementState,
-    pub(crate) is_x11: bool,
+    pub(crate) input_platform: InputPlatform,
 }
 
 impl Event<WinitInput> for WinitMouseInputEvent {
@@ -190,13 +190,8 @@ impl PointerButtonEvent<WinitInput> for WinitMouseInputEvent {
             WinitMouseButton::Middle => 0x112,
             WinitMouseButton::Forward => 0x115,
             WinitMouseButton::Back => 0x116,
-            WinitMouseButton::Other(b) => {
-                if self.is_x11 {
-                    input::xorg_mouse_to_libinput(b as u32)
-                } else {
-                    b as u32
-                }
-            }
+            WinitMouseButton::Other(b) =>
+                self.input_platform.mouse_button_to_libinput(b as _),
         }
     }
 
@@ -409,4 +404,21 @@ impl InputBackend for WinitInput {
     type SwitchToggleEvent = UnusedEvent;
 
     type SpecialEvent = UnusedEvent;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputPlatform {
+    Xorg,
+    Libinput,
+}
+
+impl InputPlatform {
+    #[inline(always)]
+    fn mouse_button_to_libinput(&self, button: u32) -> u32 {
+        match self {
+            InputPlatform::Xorg =>
+                input::xorg_mouse_to_libinput(button),
+            InputPlatform::Libinput => button,
+        }
+    }
 }

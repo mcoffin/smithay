@@ -130,17 +130,33 @@ struct App {
     seat: Seat<Self>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RendererType {
+    #[value(name = "gles")]
+    Gles,
+    #[value(name = "vulkan")]
+    Vulkan,
+}
+
+#[derive(Debug, clap::Parser)]
+struct Args {
+    #[clap(long, short, default_value = "gles")]
+    renderer: RendererType,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use clap::Parser;
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     } else {
         tracing_subscriber::fmt().init();
     }
+    let config = Args::parse();
 
-    run_winit()
+    run_winit(&config)
 }
 
-pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
+fn run_winit(config: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
