@@ -30,7 +30,11 @@ use wayland_egl as wegl;
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::pump_events::PumpStatus;
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::raw_window_handle::{
+    HasWindowHandle,
+    RawWindowHandle,
+    HandleError,
+};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, Touch, TouchPhase, WindowEvent},
@@ -81,86 +85,6 @@ where
     )
 }
 
-#[derive(Debug)]
-pub struct WinitVulkanBackend {
-    pub window: Arc<WinitWindow>,
-    pub renderer: VulkanRenderer,
-    pub instance: vulkan::Instance,
-    pub physical_device: vulkan::PhysicalDevice,
-    pub surface: vulkan::Surface,
-}
-
-impl TryFrom<Arc<WinitWindow>> for WinitVulkanBackend {
-    type Error = Box<dyn std::error::Error>;
-    fn try_from(window: Arc<WinitWindow>) -> Result<Self, Self::Error> {
-        let (instance, phd, surface) = {
-            // TODO: app_info
-            let (instance, surface) = vulkan::Instance::with_window(None, &window)?;
-            let (phd, _caps) = vulkan::PhysicalDevice::enumerate(&instance)?
-                .find_map(|phd| {
-                    let props = unsafe {
-                        surface.extension().get_physical_device_surface_capabilities(
-                            phd.handle(),
-                            surface.handle(),
-                        )
-                    }.ok()?;
-                    Some((phd, props))
-                })
-                .ok_or("Failed to select physical device")?;
-            (instance, phd, surface)
-        };
-
-        let renderer = VulkanRenderer::new(&phd)?;
-        Ok(WinitVulkanBackend {
-            window,
-            renderer,
-            instance,
-            physical_device: phd,
-            surface,
-        })
-    }
-}
-
-pub fn init_vk(
-    builder: WindowBuilder,
-) -> Result<(WinitVulkanBackend, WinitEventLoop), Error> {
-    let span = info_span!("backend_winit", window = tracing::field::Empty);
-    let _guard = span.enter();
-    info!("Initializing a winit backend");
-
-    let event_loop = EventLoopBuilder::new()
-        .build()
-        .map_err(Error::EventLoopCreation)?;
-
-    let window = Arc::new(builder.build(&event_loop).map_err(Error::WindowCreation)?);
-
-    span.record("window", Into::<u64>::into(window.id()));
-    debug!("Window created");
-
-    let gfx = WinitVulkanBackend::try_from(window.clone())
-        .map_err(Error::Surface)?;
-
-    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
-
-    drop(_guard);
-
-    Ok((
-        gfx,
-        WinitEventLoop {
-            scale_factor: window.scale_factor(),
-            start_time: Instant::now(),
-            key_counter: 0,
-            fake_token: None,
-            event_loop,
-            window,
-            pending_events: Vec::new(),
-            is_x11: false, // TODO
-            span,
-        },
-    ))
-}
-
 /// Create a new [`WinitGraphicsBackend`], which implements the [`Renderer`]
 /// trait, from a given [`WindowBuilder`] struct and a corresponding
 /// [`WinitEventLoop`].
@@ -180,6 +104,47 @@ where
             vsync: false,
         },
     )
+}
+
+#[derive(Debug)]
+pub struct WinitNoGraphics(pub Arc<WinitWindow>, WinitEventLoop);
+
+impl TryFrom<WindowBuilder> for WinitNoGraphics {
+    type Error = Error;
+    fn try_from(builder: WindowBuilder) -> Result<Self, Self::Error> {
+        let span = info_span!("backend_winit", window = tracing::field::Empty);
+        let _guard = span.enter();
+        info!("Initializing a winit backend");
+
+        let event_loop = EventLoopBuilder::new()
+            .build()
+            .map_err(Error::EventLoopCreation)?;
+
+        let window = Arc::new(builder.build(&event_loop).map_err(Error::WindowCreation)?);
+
+        span.record("window", Into::<u64>::into(window.id()));
+        debug!("Window created");
+
+        drop(_guard);
+
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
+
+        Ok(WinitNoGraphics(
+            window.clone(),
+            WinitEventLoop {
+                input_platform: window.input_platform(),
+                scale_factor: window.scale_factor(),
+                start_time: Instant::now(),
+                key_counter: 0,
+                fake_token: None,
+                event_loop,
+                window,
+                pending_events: Vec::new(),
+                span,
+            }
+        ))
+    }
 }
 
 /// Create a new [`WinitGraphicsBackend`], which implements the [`Renderer`]
@@ -207,7 +172,7 @@ where
     span.record("window", Into::<u64>::into(window.id()));
     debug!("Window created");
 
-    let (display, context, surface, is_x11) = {
+    let (display, context, surface) = {
         let display = unsafe { EGLDisplay::new(window.clone())? };
 
         let context = EGLContext::new_with_config(&display, attributes, PixelFormatRequirements::_10_bit())
@@ -215,7 +180,7 @@ where
             EGLContext::new_with_config(&display, attributes, PixelFormatRequirements::_8_bit())
         })?;
 
-        let (surface, is_x11) = match window.window_handle().map(|handle| handle.as_raw()) {
+        let surface = match window.window_handle().map(|handle| handle.as_raw()) {
             Ok(RawWindowHandle::Wayland(handle)) => {
                 debug!("Winit backend: Wayland");
                 let size = window.inner_size();
@@ -228,38 +193,32 @@ where
                 }
                 .map_err(|err| Error::Surface(err.into()))?;
                 unsafe {
-                    (
-                        EGLSurface::new(
-                            &display,
-                            context.pixel_format().unwrap(),
-                            context.config_id(),
-                            surface,
-                        )
-                        .map_err(EGLError::CreationFailed)?,
-                        false,
+                    EGLSurface::new(
+                        &display,
+                        context.pixel_format().unwrap(),
+                        context.config_id(),
+                        surface,
                     )
+                    .map_err(EGLError::CreationFailed)?
                 }
             }
             Ok(RawWindowHandle::Xlib(handle)) => {
                 debug!("Winit backend: X11");
                 unsafe {
-                    (
-                        EGLSurface::new(
-                            &display,
-                            context.pixel_format().unwrap(),
-                            context.config_id(),
-                            native::XlibWindow(handle.window),
-                        )
-                        .map_err(EGLError::CreationFailed)?,
-                        true,
+                    EGLSurface::new(
+                        &display,
+                        context.pixel_format().unwrap(),
+                        context.config_id(),
+                        native::XlibWindow(handle.window),
                     )
+                    .map_err(EGLError::CreationFailed)?
                 }
             }
             _ => panic!("only running on Wayland or with Xlib is supported"),
         };
 
         let _ = context.unbind();
-        (display, context, surface, is_x11)
+        (display, context, surface)
     };
 
     let egl = Rc::new(surface);
@@ -270,6 +229,7 @@ where
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
+    let input_platform = window.input_platform();
 
     Ok((
         WinitGraphicsBackend {
@@ -283,13 +243,13 @@ where
         },
         WinitEventLoop {
             scale_factor: window.scale_factor(),
+            input_platform: window.input_platform(),
             start_time: Instant::now(),
             key_counter: 0,
             fake_token: None,
             event_loop,
             window,
             pending_events: Vec::new(),
-            is_x11,
             span,
         },
     ))
@@ -459,7 +419,8 @@ pub struct WinitEventLoop {
     fake_token: Option<Token>,
     key_counter: u32,
     pending_events: Vec<WinitEvent>,
-    is_x11: bool,
+    /// [`InputPlatform`] that determines the values of button ids for [`input::WinitMouseInputEvent`]s
+    pub input_platform: InputPlatform,
     scale_factor: f64,
     event_loop: Generic<EventLoop<()>>,
     span: tracing::Span,
@@ -575,7 +536,7 @@ impl WinitEventLoop {
                                 time: timestamp(),
                                 button,
                                 state,
-                                is_x11: self.is_x11,
+                                input_platform: self.input_platform,
                             },
                         };
                         callback(WinitEvent::Input(event));
@@ -781,4 +742,29 @@ pub enum WinitEvent {
 
     /// A redraw was requested
     Redraw,
+}
+
+trait WindowExt {
+    fn try_input_platform(&self) -> Result<InputPlatform, HandleError>;
+    fn input_platform(&self) -> InputPlatform {
+        const DEFAULT_PLATFORM: InputPlatform = InputPlatform::Libinput;
+        self.try_input_platform().unwrap_or_else(|e| {
+            warn!(
+                "error finding input platform: {}, assuming {:?}",
+                &e,
+                DEFAULT_PLATFORM,
+            );
+            DEFAULT_PLATFORM
+        })
+    }
+}
+
+impl<W: HasWindowHandle> WindowExt for W {
+    fn try_input_platform(&self) -> Result<InputPlatform, HandleError> {
+        Ok(match self.window_handle()?.as_raw() {
+            RawWindowHandle::Xlib(..)
+            | RawWindowHandle::Xcb(..) => InputPlatform::Xorg,
+            _ => InputPlatform::Libinput,
+        })
+    }
 }
