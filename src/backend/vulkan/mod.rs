@@ -90,6 +90,7 @@ use self::{inner::InstanceInner, version::Version};
 #[cfg(feature = "backend_drm")]
 use super::drm::DrmNode;
 
+pub mod util;
 pub mod native;
 mod surface;
 pub use surface::Surface;
