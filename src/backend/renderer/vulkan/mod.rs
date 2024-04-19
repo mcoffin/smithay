@@ -229,17 +229,7 @@ impl Renderer for VulkanRenderer {
     ) -> Result<Self::Frame<'_>, Self::Error> {
         let target = self.target.as_ref()
             .ok_or(Error::NoTarget)?;
-        let layout = match target {
-            &VulkanTarget::Image { initial_layout, .. } => initial_layout,
-        };
-        Ok(VulkanFrame {
-            renderer: self,
-            target,
-            layout,
-            clear_semaphore: vk::Semaphore::null(),
-            clear_buffer: vk::CommandBuffer::null(),
-            device: Arc::downgrade(&self.device),
-        })
+        todo!()
     }
 }
 
@@ -480,11 +470,6 @@ impl ImportDma for VulkanRenderer {
 #[derive(Debug)]
 pub struct VulkanFrame<'a> {
     renderer: &'a VulkanRenderer,
-    target: &'a VulkanTarget,
-    layout: vk::ImageLayout,
-    clear_semaphore: vk::Semaphore,
-    clear_buffer: vk::CommandBuffer,
-    device: Weak<Device>,
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
@@ -513,77 +498,7 @@ impl<'a> Frame for VulkanFrame<'a> {
         color: [f32; 4],
         at: &[Rectangle<i32, Physical>]
     ) -> Result<(), Self::Error> {
-        assert!(
-            self.clear_buffer == vk::CommandBuffer::null()
-                && self.clear_semaphore == vk::Semaphore::null()
-        );
-        let mut alloc_info = vk::CommandBufferAllocateInfo::builder()
-            .command_pool(*self.renderer.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY);
-        let device: &ash::Device = &self.renderer.device;
-        let mut buf = [vk::CommandBuffer::null(); 1];
-        unsafe {
-            device
-                .allocate_command_buffers_array(
-                    &mut alloc_info,
-                    &mut buf,
-                )
-        }.map_err(Error::vk("vkAllocateCommandBuffers"))?;
-        let buf = scopeguard::guard(buf, |buf| unsafe {
-            device.free_command_buffers(
-                *self.renderer.command_pool,
-                &buf
-            );
-        });
-        self.clear_buffer = buf[0];
-        unsafe {
-            let begin_info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device.begin_command_buffer(self.clear_buffer, &begin_info)
-                .map_err(Error::vk("vkBeginCommandBuffer"))?;
-        }
-        let subresource_ranges = [
-            vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-        ];
-        let qidx = self.renderer.queue.0 as u32;
-        let image = self.target.image();
-        let barrier = vk::ImageMemoryBarrier::builder()
-            .old_layout(self.layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(qidx)
-            .dst_queue_family_index(qidx)
-            .image(image)
-            .subresource_range(subresource_ranges[0])
-            .build();
-        unsafe {
-            if barrier.src_queue_family_index != barrier.dst_queue_family_index {
-                device.cmd_pipeline_barrier(
-                    self.clear_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[], &[], &[barrier],
-                );
-            }
-            device.cmd_clear_color_image(
-                self.clear_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue {
-                    float32: color,
-                },
-                &subresource_ranges,
-            );
-            self.layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-            device.end_command_buffer(self.clear_buffer)
-        }.map_err(Error::vk("vkEndCommandBuffer"))?;
-        Ok(())
+        todo!()
     }
     fn draw_solid(
         &mut self,
