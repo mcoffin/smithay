@@ -6,6 +6,7 @@ use ash::{
     },
 };
 use crate::{
+    fn_name,
     contextual_handles,
     backend::{
         allocator::{dmabuf::{Dmabuf, WeakDmabuf}, Buffer, Format as DrmFormat, Fourcc, Modifier as DrmModifier},
@@ -17,7 +18,6 @@ use crate::{
                 ContextualHandle,
             },
             version::Version,
-            Instance,
             PhysicalDevice,
         },
     },
@@ -25,10 +25,8 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    ffi::CStr,
     fmt,
     os::fd::{
-        BorrowedFd,
         AsRawFd,
         IntoRawFd,
     },
@@ -43,7 +41,13 @@ use std::{
     },
 };
 use super::ImportDma;
-use tracing::{trace, error};
+#[allow(unused_imports)]
+use tracing::{
+    trace,
+    debug,
+    error,
+    warn,
+};
 use scopeguard::ScopeGuard;
 
 mod dmabuf;
@@ -63,7 +67,6 @@ pub struct VulkanRenderer {
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     target: Option<VulkanTarget>,
-    command_pool: OwnedHandle<vk::CommandPool, Device>,
 }
 
 impl VulkanRenderer {
@@ -140,13 +143,13 @@ impl VulkanRenderer {
 
         let device = Arc::new(device);
 
-        let pool_info = vk::CommandPoolCreateInfo::builder()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(queue_family_idx as _);
-        let pool = unsafe {
-            device.create_command_pool(&pool_info, None)
-                .map(|v| OwnedHandle::from_arc(v, &device))
-        }.map_err(Error::vk("vkCreateCommandPool"))?;
+        // let pool_info = vk::CommandPoolCreateInfo::builder()
+        //     .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+        //     .queue_family_index(queue_family_idx as _);
+        // let pool = unsafe {
+        //     device.create_command_pool(&pool_info, None)
+        //         .map(|v| OwnedHandle::from_arc(v, &device))
+        // }.map_err(Error::vk("vkCreateCommandPool"))?;
 
         Ok(VulkanRenderer {
             phd: phd.clone(),
@@ -160,7 +163,6 @@ impl VulkanRenderer {
             dmabuf_cache: HashMap::new(),
             memory_props,
             target: None,
-            command_pool: pool,
         })
     }
 
@@ -474,15 +476,8 @@ pub struct VulkanFrame<'a> {
 
 impl<'a> Drop for VulkanFrame<'a> {
     fn drop(&mut self) {
-        if self.clear_semaphore != vk::Semaphore::null() {
-            let Some(device) = self.device.upgrade() else {
-                error!("device destroyed before frame: {:?}", self);
-                return;
-            };
-            unsafe {
-                device.destroy_semaphore(self.clear_semaphore, None);
-            }
-        }
+        trace!("{}", fn_name!());
+        todo!();
     }
 }
 
@@ -495,27 +490,27 @@ impl<'a> Frame for VulkanFrame<'a> {
     }
     fn clear(
         &mut self,
-        color: [f32; 4],
-        at: &[Rectangle<i32, Physical>]
+        _color: [f32; 4],
+        _at: &[Rectangle<i32, Physical>]
     ) -> Result<(), Self::Error> {
         todo!()
     }
     fn draw_solid(
         &mut self,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        color: [f32; 4]
+        _dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+        _color: [f32; 4]
     ) -> Result<(), Self::Error> {
         todo!()
     }
     fn render_texture_from_to(
         &mut self,
-        texture: &Self::TextureId,
-        src: Rectangle<f64, BufferCoord>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        src_transform: Transform,
-        alpha: f32
+        _texture: &Self::TextureId,
+        _src: Rectangle<f64, BufferCoord>,
+        _dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+        _src_transform: Transform,
+        _alpha: f32
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -603,14 +598,6 @@ impl Extensions {
     }
 }
 
-fn known_formats() -> impl Iterator<Item=(Fourcc, vk::Format)> {
-    use crate::backend::allocator::vulkan::format;
-    format::known_formats()
-        .iter()
-        .copied()
-        .filter_map(|f| format::get_vk_format(f).map(move |vk| (f, vk)))
-}
-
 #[derive(Debug)]
 struct FormatInfo {
     vk: vk::Format,
@@ -621,7 +608,8 @@ struct FormatInfo {
 
 impl FormatInfo {
     fn get_known(phd: &PhysicalDevice) -> impl Iterator<Item=Self> + '_ {
-        known_formats().map(|(fourcc, vk_format)| {
+        use crate::backend::allocator::vulkan::format;
+        format::known_vk_formats().map(|(fourcc, vk_format)| {
             Self::new(phd, fourcc, vk_format)
         })
     }

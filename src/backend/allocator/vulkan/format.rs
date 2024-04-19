@@ -1,5 +1,8 @@
 //! Format conversions between Vulkan and DRM formats.
 
+use ash::vk;
+use crate::backend::allocator::Fourcc;
+
 /// Macro to generate format conversions between Vulkan and FourCC format codes.
 ///
 /// Any entry in this table may have attributes associated with a conversion. This is needed for `PACK` Vulkan
@@ -80,4 +83,10 @@ vk_format_table! {
     Abgr2101010 => A2B10G10R10_UNORM_PACK32,
     #[cfg(target_endian = "little")]
     Xbgr2101010 => A2B10G10R10_UNORM_PACK32,
+}
+
+pub(crate) fn known_vk_formats() -> impl Iterator<Item=(Fourcc, vk::Format)> {
+    known_formats()
+        .iter()
+        .filter_map(|&f| get_vk_format(f).map(move |vk| (f, vk)))
 }
