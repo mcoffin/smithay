@@ -8,11 +8,17 @@ use std::{
 };
 use tracing::error;
 
-pub(crate) trait ContextualHandle: Sized + Copy + fmt::Debug {
+pub(crate) trait VulkanHandle: Sized + Copy + Eq {
+    fn null() -> Self;
+    #[inline]
+    fn is_null(&self) -> bool {
+        self == &Self::null()
+    }
+}
+
+pub(crate) trait ContextualHandle: VulkanHandle + fmt::Debug {
     type Context;
     const TYPE_NAME: &'static str;
-    fn null() -> Self;
-    fn is_null(&self) -> bool;
     unsafe fn destroy(self, ctx: &Self::Context);
 }
 
@@ -86,22 +92,42 @@ where
     }
 }
 
+impl<T, C> PartialEq<T> for OwnedHandle<T, C>
+where
+    T: ContextualHandle<Context=C> + Eq,
+    C: fmt::Debug,
+{
+    #[inline(always)]
+    fn eq(&self, rhs: &T) -> bool {
+        &self.handle == rhs
+    }
+}
+
 #[doc(hidden)]
 #[macro_export]
-macro_rules! contextual_handles {
-    ($ctx:ty { $($handle:ty = $destroy_fn:ident),+ $(,)?}) => {
+macro_rules! vulkan_handles {
+    ($($t:ty),+ $(,)?) => {
         $(
-            impl ContextualHandle for $handle {
-                type Context = $ctx;
-                const TYPE_NAME: &'static str = stringify!($handle);
+            impl $crate::backend::vulkan::util::VulkanHandle for $t {
                 #[inline(always)]
                 fn null() -> Self {
                     Self::null()
                 }
+            }
+        )+
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! contextual_handles {
+    ($ctx:ty { $($handle:ty = $destroy_fn:ident),+ $(,)? }) => {
+        vulkan_handles!($($handle),+);
+        $(
+            impl $crate::backend::vulkan::util::ContextualHandle for $handle {
+                type Context = $ctx;
+                const TYPE_NAME: &'static str = stringify!($handle);
                 #[inline(always)]
-                fn is_null(&self) -> bool {
-                    self == &Self::null()
-                }
                 unsafe fn destroy(self, ctx: &Self::Context) {
                     ctx.$destroy_fn(self, None);
                 }
