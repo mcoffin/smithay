@@ -31,6 +31,7 @@ impl<'a> VulkanNativeWindow<'static> for VulkanNativeWayland<'a> {
     #[inline(always)]
     fn required_extensions(&self) -> &'static [&'static CStr] {
         const EXTS: &[&CStr] = &[
+            vk::KhrSurfaceFn::name(),
             vk::KhrWaylandSurfaceFn::name(),
         ];
         EXTS

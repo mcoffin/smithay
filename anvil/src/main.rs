@@ -20,6 +20,8 @@ enum Backend {
 enum Renderer {
     #[value(name = "gles")]
     Gles,
+    #[value(name = "vulkan")]
+    Vulkan,
 }
 
 impl Default for Renderer {
@@ -56,16 +58,20 @@ fn main() {
     profiling::puffin::set_scopes_on(true);
 
     let config = Args::parse();
-    match config.backend {
-        Backend::Winit => {
-            tracing::info!("Starting anvil with winit backend");
-            anvil::winit::run_winit();
+    match (config.backend, config.renderer) {
+        (Backend::Winit, Renderer::Gles) => {
+            tracing::info!("Starting anvil with winit/gles backend");
+            anvil::winit::run_winit_gles();
         },
-        Backend::Udev => {
+        (Backend::Winit, Renderer::Vulkan) => {
+            tracing::info!("Starting anvil with winit/vulkan backend");
+            anvil::winit::run_winit_vulkan();
+        },
+        (Backend::Udev, ..) => {
             tracing::info!("Starting anvil on a tty using udev");
             anvil::udev::run_udev();
         },
-        Backend::X11 => {
+        (Backend::X11, ..) => {
             tracing::info!("Starting anvil with x11 backend");
             anvil::x11::run_x11();
         },

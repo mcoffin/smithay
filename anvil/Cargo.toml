@@ -24,7 +24,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 [dependencies.smithay]
 default-features = false
-features = ["desktop", "wayland_frontend"]
+features = ["desktop", "wayland_frontend", "renderer_vulkan"]
 path = ".."
 
 [dependencies.x11rb]
