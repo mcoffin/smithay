@@ -1,14 +1,19 @@
+//! Internal helper macros and functions used therein. Not really intended for external use
+
 /// Helper function used solely for getting the fully qualified type name of the
 /// containing function
 ///
 /// # TODO
-/// Could be `const` once [`std::any::type_name`] is `const` for `stable branch
+/// Could be `const` once the following are `const` for `stable branch
+///
+/// * [`core::any::type_name`]
+/// * [`core::slice::SliceIndex<str>`](core::slice::SliceIndex<str>) for
+/// [`core::ops::Range<usize>`]
 #[doc(hidden)]
 #[inline(always)]
 pub fn get_function_name<T>(_: T) -> &'static str {
     let s = core::any::type_name::<T>();
-    s.strip_suffix("::f")
-        .unwrap_or(s)
+    &s[..s.len()-3]
 }
 
 #[macro_export]
