@@ -259,8 +259,7 @@ impl Instance {
 
         // Enable debug layers if present and debug assertions are enabled.
         if cfg!(debug_assertions) {
-            const VALIDATION: &CStr =
-                unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") };
+            const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
             if available_layers
                 .iter()

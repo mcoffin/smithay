@@ -59,7 +59,6 @@ use crate::{
             },
             Bind,
         },
-        vulkan,
     },
     utils::{Physical, Rectangle, Size},
 };
@@ -78,6 +77,15 @@ where
     crate::backend::SwapBuffersError: From<<R as Renderer>::Error>,
 {
     init_from_builder(
+        WindowBuilder::new()
+            .with_inner_size(LogicalSize::new(1280.0, 800.0))
+            .with_title("Smithay")
+            .with_visible(true),
+    )
+}
+
+pub fn init_no_graphics() -> Result<WinitNoGraphics, Error> {
+    WinitNoGraphics::try_from(
         WindowBuilder::new()
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_title("Smithay")
@@ -107,7 +115,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct WinitNoGraphics(pub Arc<WinitWindow>, WinitEventLoop);
+pub struct WinitNoGraphics(pub Arc<WinitWindow>, pub WinitEventLoop);
 
 impl TryFrom<WindowBuilder> for WinitNoGraphics {
     type Error = Error;
