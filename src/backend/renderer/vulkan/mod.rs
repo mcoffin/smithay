@@ -1,4 +1,5 @@
 use ash::{
+    prelude::VkResult,
     vk,
     extensions::{
         ext::ImageDrmFormatModifier,
@@ -8,14 +9,15 @@ use ash::{
 use crate::{
     fn_name,
     contextual_handles,
+    vulkan_handles,
     backend::{
         allocator::{dmabuf::{Dmabuf, WeakDmabuf}, Buffer, Format as DrmFormat, Fourcc, Modifier as DrmModifier},
         drm::DrmNode,
         renderer::{sync::SyncPoint, DebugFlags, Frame, Renderer, Texture, TextureFilter},
         vulkan::{
             util::{
+                VulkanHandle,
                 OwnedHandle,
-                ContextualHandle,
             },
             version::Version,
             PhysicalDevice,
@@ -36,6 +38,10 @@ use std::{
     },
     rc::Rc,
     sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
         Arc,
         Weak,
     },
@@ -54,39 +60,36 @@ mod dmabuf;
 mod util;
 use util::*;
 
+const DEFAULT_COMMAND_BUFFERS: usize = 4;
+
+/// [`Renderer`] implementation using the [`vulkan`](https://www.vulkan.org/) graphics API
 #[derive(Debug)]
 pub struct VulkanRenderer {
     phd: PhysicalDevice,
     device: Arc<Device>,
     queue: (usize, vk::Queue),
-    node: Option<DrmNode>,
+    _node: Option<DrmNode>,
     formats: HashMap<Fourcc, FormatInfo>,
     dmabuf_formats: Rc<[DrmFormat]>,
     extensions: Extensions,
     debug_flags: DebugFlags,
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
-    target: Option<VulkanTarget>,
+    command_pool: OwnedHandle<vk::CommandPool, Device>,
+    command_buffers: Box<[vk::CommandBuffer]>,
+    command_buffer_usage: Box<[AtomicBool]>,
 }
 
 impl VulkanRenderer {
-    fn required_extensions(phd: &PhysicalDevice) -> &'static [*const i8] {
-        const EXTS: &[*const i8] = &[
-            // Always
-            vk::ExtImageDrmFormatModifierFn::name().as_ptr(),
-            vk::ExtExternalMemoryDmaBufFn::name().as_ptr(),
-            vk::KhrExternalMemoryFdFn::name().as_ptr(),
-            // < 1.2
-            vk::KhrImageFormatListFn::name().as_ptr(),
-        ];
-        if phd.api_version() >= Version::VERSION_1_2 {
-            &EXTS[..3]
-        } else {
-            EXTS
-        }
-    }
-
-    /// create a new [`VulkanRenderer`] from this [`PhysicalDevice`]
+    /// Creates a new [`VulkanRenderer`] from this [`PhysicalDevice`]. The renderer is initially
+    /// bound to *no target*, meaning calling [`Renderer::render`] without first binding to a valid
+    /// target is an invalid operation
+    ///
+    /// Will look up supported formatting information inline to cache for future reference.
+    ///
+    /// # Safety/Assumptions
+    ///
+    /// The [`PhysicalDevice`] must be on an api version greater than or equal to Vulkan 1.1
     pub fn new(phd: &PhysicalDevice) -> Result<Self, Error<'static>> {
         let queue_family_idx = phd.graphics_queue_family()
             .ok_or(Error::NoGraphicsQueue)?;
@@ -143,27 +146,83 @@ impl VulkanRenderer {
 
         let device = Arc::new(device);
 
-        // let pool_info = vk::CommandPoolCreateInfo::builder()
-        //     .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-        //     .queue_family_index(queue_family_idx as _);
-        // let pool = unsafe {
-        //     device.create_command_pool(&pool_info, None)
-        //         .map(|v| OwnedHandle::from_arc(v, &device))
-        // }.map_err(Error::vk("vkCreateCommandPool"))?;
+        let mut pool_info = vk::CommandPoolCreateInfo::builder()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(queue_family_idx as _)
+            .build();
+        let pool = unsafe {
+            device.create_command_pool(&pool_info, None)
+                .or_else(|_| {
+                    pool_info.flags = vk::CommandPoolCreateFlags::empty();
+                    device.create_command_pool(&pool_info, None)
+                })
+                .map(|v| OwnedHandle::from_arc(v, &device))
+        }.vk("vkCreateCommandPool")?;
+
+        let cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(*pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(DEFAULT_COMMAND_BUFFERS as _);
+        let cmd_buffers = unsafe {
+            device.allocate_command_buffers(&cmd_buf_alloc_info)
+        }.vk("vkAllocateCommandBuffers")?;
+
+        let cmd_buffer_usage = {
+            let mut ret = Vec::with_capacity(cmd_buffers.len());
+            let usage_it = std::iter::repeat_with(|| AtomicBool::new(false));
+            ret.extend(usage_it.take(cmd_buffers.len()));
+            ret.into()
+        };
 
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
             queue: (queue_family_idx, queue),
-            node,
+            _node: node,
             formats,
             dmabuf_formats: dmabuf_formats.into(),
             extensions,
             debug_flags: DebugFlags::empty(),
             dmabuf_cache: HashMap::new(),
             memory_props,
-            target: None,
+            command_pool: pool,
+            command_buffers: cmd_buffers.into(),
+            command_buffer_usage: cmd_buffer_usage,
         })
+    }
+
+    /// List of extensions required by a [`VulkanRenderer`]
+    ///
+    /// This *may* be sliced at runtime based on the vulkan version. See source for comment
+    /// references on where it would be sliced for given vulkan versions
+    ///
+    /// # See also
+    ///
+    /// * [`VulkanRenderer::required_extensions`]
+    const EXTS: &'static [*const i8] = &[
+        // Always
+        vk::ExtImageDrmFormatModifierFn::name().as_ptr(),
+        vk::ExtExternalMemoryDmaBufFn::name().as_ptr(),
+        vk::KhrExternalMemoryFdFn::name().as_ptr(),
+        // < 1.2
+        vk::KhrImageFormatListFn::name().as_ptr(),
+    ];
+
+    /// Gets a list of extensions required to run a [`VulkanRenderer`] on the given
+    /// [`PhysicalDevice`], as a `'static` slice of [`CStr`]-style pointers (i.e. null-terminated
+    /// strings.
+    ///
+    /// Uses [`PhysicalDevice::api_version`] to determine what is necessary to enable
+    /// given the currently-in-use API version
+    fn required_extensions(phd: &PhysicalDevice) -> &'static [*const i8] {
+        let v = phd.api_version();
+        if v < Version::VERSION_1_1 {
+            panic!("unsupported vulkan api version: {:?}", v);
+        } else if v >= Version::VERSION_1_2 {
+            &Self::EXTS[..3]
+        } else {
+            Self::EXTS
+        }
     }
 
     #[inline(always)]
@@ -194,6 +253,39 @@ impl VulkanRenderer {
             .filter(|&(idx, ..)| (type_mask & (0b1 << idx)) != 0)
             .find(|(_idx, ty)| (ty.property_flags & props) == props)
     }
+
+    #[inline(always)]
+    fn command_buffers(&self) -> impl Iterator<Item=(vk::CommandBuffer, &AtomicBool)> {
+        self.command_buffers.iter()
+            .copied()
+            .zip(&*self.command_buffer_usage)
+    }
+
+    /// TODO: verify this AtomicBool logic and ordering w/ [`CommandBuffer::drop`]
+    fn acquire_command_buffer(&self) -> Result<CommandBuffer<'_>, Error<'static>> {
+        self.command_buffers()
+            .find(|&(_buf, in_use)| in_use.compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire).is_ok())
+            .map(CommandBuffer::from)
+            .ok_or(Error::AllCommandBuffersBusy)
+    }
+}
+
+impl Drop for VulkanRenderer {
+    fn drop(&mut self) {
+        // TODO: consider moving this into some kind of wrapper?
+        unsafe {
+            if self.command_buffers.len() > 0 && self.command_buffers.iter().any(|&buf| !buf.is_null()) {
+                self.device.free_command_buffers(*self.command_pool, &self.command_buffers);
+            }
+        }
+    }
+}
+
+
+macro_rules! vk_call {
+    ($e:expr, $fname:expr) => {
+        unsafe { $e }.vk($fname)
+    };
 }
 
 impl Renderer for VulkanRenderer {
@@ -219,6 +311,7 @@ impl Renderer for VulkanRenderer {
         todo!()
     }
     fn set_debug_flags(&mut self, flags: DebugFlags) {
+        warn!("debug flags currently ignored: {:?}", flags);
         self.debug_flags = flags;
     }
     fn debug_flags(&self) -> DebugFlags {
@@ -229,30 +322,20 @@ impl Renderer for VulkanRenderer {
         _output_size: Size<i32, Physical>,
         _dst_transform: Transform
     ) -> Result<Self::Frame<'_>, Self::Error> {
-        let target = self.target.as_ref()
-            .ok_or(Error::NoTarget)?;
+        Ok(VulkanFrame {
+            renderer: self,
+            command_buffer: self.acquire_command_buffer()?,
+        })
+    }
+    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
         todo!()
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum VulkanTarget {
-    Image {
-        image: vk::Image,
-        initial_layout: vk::ImageLayout,
-        target_layout: vk::ImageLayout,
-    },
-}
-
-impl VulkanTarget {
-    #[inline(always)]
-    fn image(&self) -> vk::Image {
-        match self {
-            &VulkanTarget::Image { image, .. } => image,
-        }
-    }
-}
-
+/// Maximum number of planes supported for imported [`Dmabuf`]s
+///
+/// Used to statically-size arrays relative to planes to avoid extra allocations being required on
+/// each call to [`ImportDma::import_dmabuf`] for [`VulkanRenderer`]
 const MAX_PLANES: usize = 4;
 
 impl ImportDma for VulkanRenderer {
@@ -319,8 +402,10 @@ impl ImportDma for VulkanRenderer {
                 self.phd.handle(),
                 &info,
                 &mut image_fmt
-            ).map_err(Error::vk("vkGetPhysicalDeviceImageFormatProperties2"))?;
-            image_fmt.image_format_properties
+            ).vk("vkGetPhysicalDeviceImageFormatProperties2")?;
+            let image_fmt_props = image_fmt.image_format_properties;
+            trace!("vkGetPhysicalDeviceImageFormatProperties2:\n{:#?}", &image_fmt_props);
+            image_fmt_props
         };
 
         let mut drm_info: vk::ImageDrmFormatModifierExplicitCreateInfoEXTBuilder<'_>;
@@ -387,7 +472,7 @@ impl ImportDma for VulkanRenderer {
         let mut bind_infos = [vk::BindImageMemoryInfo::default(); MAX_PLANES];
         let mut memories = scopeguard::guard([vk::DeviceMemory::null(); MAX_PLANES], |memories| unsafe {
             for m in memories {
-                if m != vk::DeviceMemory::null() {
+                if !m.is_null() {
                     self.device.free_memory(m, None);
                 }
             }
@@ -420,9 +505,10 @@ impl ImportDma for VulkanRenderer {
                     .memory_type_index(mem_idx as _)
                     .push_next(&mut dedicated_info)
                     .push_next(&mut import_info);
-                *dm = unsafe {
-                    self.device.allocate_memory(&create_info, None)
-                }.map_err(Error::vk("vkAllocateMemory"))?;
+                *dm = vk_call!(
+                    self.device.allocate_memory(&create_info, None),
+                    "vkAllocateMemory"
+                )?;
                 trace!("vkAllocateMemory:\n{:#?} -> {:?}", &create_info.build(), dm);
 
                 // this fd will be closed by vulkan once the image is free'd
@@ -444,9 +530,10 @@ impl ImportDma for VulkanRenderer {
         let mems = &memories[..mem_count];
         trace!("import_dmabuf: imported device memories[{}]:\n{:#?}", mems.len(), mems);
 
-        unsafe {
-            self.device.bind_image_memory2(&bind_infos[..mems.len()])
-        }.map_err(Error::vk("vkBindImageMemory2"))?;
+        vk_call!(
+            self.device.bind_image_memory2(&bind_infos[..mems.len()]),
+            "vkBindImageMemory2"
+        )?;
 
         let image = VulkanImage::new(InnerImage {
             image: ScopeGuard::into_inner(image),
@@ -469,9 +556,13 @@ impl ImportDma for VulkanRenderer {
     }
 }
 
+/// [`Frame`] implementation used by a [`VulkanRenderer`]
+///
+/// * See [`Renderer`] and [`Frame`]
 #[derive(Debug)]
 pub struct VulkanFrame<'a> {
     renderer: &'a VulkanRenderer,
+    command_buffer: CommandBuffer<'a>,
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
@@ -517,6 +608,9 @@ impl<'a> Frame for VulkanFrame<'a> {
     fn transformation(&self) -> Transform {
         Transform::Normal
     }
+    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+        todo!()
+    }
     fn finish(self) -> Result<SyncPoint, Self::Error> {
         todo!()
     }
@@ -529,6 +623,7 @@ struct Format {
     modifier: Option<vk::DrmFormatModifierPropertiesEXT>,
 }
 
+/// [`Texture`] implementation for a [`VulkanRenderer`]
 #[derive(Debug, Clone)]
 #[repr(transparent)]
 pub struct VulkanImage(Arc<InnerImage>);
@@ -690,30 +785,66 @@ impl fmt::Debug for Device {
     }
 }
 
+/// [`Error`](std::error::Error) enum representing errors that can occur working with a
+/// [`VulkanRenderer`]
 #[derive(Debug, thiserror::Error)]
 pub enum Error<'a> {
+    /// Occurs when the [`PhysicalDevice`] used to create the [`VulkanRenderer`] does not support a
+    /// valid `GRAPHICS` queue family
     #[error("physical device had no graphics queue family")]
     NoGraphicsQueue,
+    /// Wrapper for [`vk::Result`], including `context` as the name of the vulkan function that
+    /// triggered the wrapped error
     #[error("{context}: {result}")]
     Vk {
+        /// contextual information about what caused the given error.
+        ///
+        /// This is usually the name of the vulkan function from which the error originated
         context: &'a str,
+        /// Inner [`vk::Result`] value returned by the function named in `context`
         result: vk::Result,
     },
+    /// Simple wrapper for [`dmabuf::DmabufError`]
     #[error("error importing dmabuf: {0}")]
     Dmabuf(#[from] dmabuf::DmabufError),
+    /// Occurs when [`ImportDma::import_dmabuf`] is called with an unknown format
     #[error("failed to convert import format: {0:?}")]
     UnknownFormat(DrmFormat),
+    /// Occurs when [`Renderer::render`] is called without a target bound for the renderer
     #[error("no render target bound")]
     NoTarget,
+    /// Occurs if a new rendering frame is started, but all of the available command buffers are
+    /// already busy
+    #[error("all command buffers already busy")]
+    AllCommandBuffersBusy,
 }
 
 impl<'a> Error<'a> {
+    /// # See also
+    ///
+    /// * [`ErrorExt::vk`]
     #[inline(always)]
     fn vk(s: &'a str) -> impl Fn(vk::Result) -> Self + 'a {
         move |e: vk::Result| Error::Vk {
             context: s,
             result: e,
         }
+    }
+}
+
+/// Helper trait for [`VkResult`]
+trait ErrorExt {
+    type Ret;
+    /// Helper function for converting [`VkResult`] values to [`Result`]s with the error as
+    /// [`Error`]
+    fn vk(self, ctx: &str) -> Result<Self::Ret, Error<'_>>;
+}
+
+impl<T> ErrorExt for VkResult<T> {
+    type Ret = T;
+    #[inline(always)]
+    fn vk(self, ctx: &str) -> Result<Self::Ret, Error<'_>> {
+        self.map_err(Error::vk(ctx))
     }
 }
 
@@ -802,6 +933,45 @@ impl DeviceExt for ash::Device {
     }
 }
 
+/// Borrowed [`vk::CommandBuffer`] from a [`VulkanRenderer`]
+///
+/// Will set it's `in_use` flag back to `false` in the [`Drop`] implementation
+#[derive(Debug)]
+struct CommandBuffer<'a> {
+    handle: vk::CommandBuffer,
+    in_use: &'a AtomicBool,
+}
+
+impl<'a> Drop for CommandBuffer<'a> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        trace!("{}", fn_name!());
+        // in release mode, just store the value as `false`, assuming that the previous value was
+        // `true`
+        #[cfg(not(debug_assertions))]
+        self.in_use.store(false, Ordering::Relaxed);
+
+        // in debug mode, use `compare_exchange` to ensure the value was previously `true`
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(self.in_use.compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire), Ok(true))
+        }
+    }
+}
+
+impl<'a> From<(vk::CommandBuffer, &'a AtomicBool)> for CommandBuffer<'a> {
+    #[inline(always)]
+    fn from(v: (vk::CommandBuffer, &'a AtomicBool)) -> Self {
+        let (handle, in_use) = v;
+        CommandBuffer { handle, in_use }
+    }
+}
+
 contextual_handles!(Device {
     vk::CommandPool = destroy_command_pool,
 });
+
+vulkan_handles! {
+    vk::CommandBuffer,
+    vk::DeviceMemory,
+}

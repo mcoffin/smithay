@@ -766,7 +766,9 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
             vk::DebugUtilsMessageSeverityFlagsEXT::INFO => info!(ty, "{}", message),
             vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => warn!(ty, "{}", message),
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => error!(ty, "{}", message),
-            _ => (),
+            _ => {
+                panic!("unknown debug message severity: {:?}", message_severity);
+            },
         }
     });
 

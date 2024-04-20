@@ -28,7 +28,6 @@ pub use serial::*;
 mod clock;
 pub use clock::*;
 
-#[doc(hidden)]
 pub mod macros;
 
 /// This resource is not managed by Smithay
