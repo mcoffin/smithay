@@ -134,3 +134,14 @@ pub enum SwapBuffersError {
     #[error("A temporary condition caused the page flip to fail: {0}")]
     TemporaryFailure(Box<dyn std::error::Error + Send + Sync>),
 }
+
+impl SwapBuffersError {
+    /// Convenience function for constructing a `TemporaryFailure` variant
+    #[inline]
+    pub fn temporary_failure<T>(e: T) -> Self
+    where
+        Box<dyn std::error::Error + Send + Sync>: From<T>,
+    {
+        SwapBuffersError::TemporaryFailure(e.into())
+    }
+}

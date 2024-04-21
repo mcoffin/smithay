@@ -26,7 +26,7 @@ use smithay::{
         winit::{
             self,
             WinitEvent,
-            WinitGraphicsBackend,
+            WinitGlesGraphicsBackend,
             WinitNoGraphics,
         },
         SwapBuffersError,
@@ -41,7 +41,7 @@ use smithay::{
         calloop::EventLoop,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{protocol::wl_surface, Display},
-        winit::{dpi::LogicalSize, platform::pump_events::PumpStatus},
+        winit::platform::pump_events::PumpStatus,
     },
     utils::{IsAlive, Scale, Transform},
     wayland::{
@@ -59,7 +59,7 @@ use crate::{drawing::*, render::*};
 pub const OUTPUT_NAME: &str = "winit";
 
 pub struct WinitData {
-    backend: WinitGraphicsBackend<GlesRenderer>,
+    backend: WinitGlesGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     full_redraw: u8,
