@@ -26,7 +26,8 @@ use smithay::{
         winit::{
             self,
             WinitEvent,
-            WinitGlesGraphicsBackend,
+            WinitGraphicsBackend,
+            WinitGlesGraphics,
             WinitNoGraphics,
         },
         SwapBuffersError,
@@ -59,7 +60,7 @@ use crate::{drawing::*, render::*};
 pub const OUTPUT_NAME: &str = "winit";
 
 pub struct WinitData {
-    backend: WinitGlesGraphicsBackend<GlesRenderer>,
+    backend: WinitGraphicsBackend<WinitGlesGraphics<GlesRenderer>>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     full_redraw: u8,

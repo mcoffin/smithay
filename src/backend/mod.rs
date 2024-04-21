@@ -144,4 +144,9 @@ impl SwapBuffersError {
     {
         SwapBuffersError::TemporaryFailure(e.into())
     }
+
+    #[inline(always)]
+    pub fn resize_surface() -> Self {
+        Self::temporary_failure("failed to resize underlying surface")
+    }
 }
