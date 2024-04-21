@@ -138,15 +138,10 @@ pub enum SwapBuffersError {
 impl SwapBuffersError {
     /// Convenience function for constructing a `TemporaryFailure` variant
     #[inline]
-    pub fn temporary_failure<T>(e: T) -> Self
+    fn temporary_failure<T>(e: T) -> Self
     where
         Box<dyn std::error::Error + Send + Sync>: From<T>,
     {
         SwapBuffersError::TemporaryFailure(e.into())
-    }
-
-    #[inline(always)]
-    pub fn resize_surface() -> Self {
-        Self::temporary_failure("failed to resize underlying surface")
     }
 }
