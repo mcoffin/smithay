@@ -1,60 +1,41 @@
-use ash::{
-    prelude::VkResult,
-    vk,
-    extensions::{
-        ext::ImageDrmFormatModifier,
-        khr::ExternalMemoryFd,
-    },
-};
+use super::ImportDma;
 use crate::{
-    fn_name,
-    contextual_handles,
-    vulkan_handles,
     backend::{
-        allocator::{dmabuf::{Dmabuf, WeakDmabuf}, Buffer, Format as DrmFormat, Fourcc, Modifier as DrmModifier},
+        allocator::{
+            dmabuf::{Dmabuf, WeakDmabuf},
+            Buffer, Format as DrmFormat, Fourcc, Modifier as DrmModifier,
+        },
         drm::DrmNode,
         renderer::{sync::SyncPoint, DebugFlags, Frame, Renderer, Texture, TextureFilter},
         vulkan::{
-            util::{
-                VulkanHandle,
-                OwnedHandle,
-            },
+            util::{OwnedHandle, VulkanHandle},
             version::Version,
             PhysicalDevice,
         },
     },
+    contextual_handles, fn_name,
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+    vulkan_handles,
 };
+use ash::{
+    extensions::{ext::ImageDrmFormatModifier, khr::ExternalMemoryFd},
+    prelude::VkResult,
+    vk,
+};
+use scopeguard::ScopeGuard;
 use std::{
     collections::HashMap,
     fmt,
-    os::fd::{
-        AsRawFd,
-        IntoRawFd,
-    },
-    ops::{
-        Deref,
-        DerefMut,
-    },
+    ops::{Deref, DerefMut},
+    os::fd::{AsRawFd, IntoRawFd},
     rc::Rc,
     sync::{
-        atomic::{
-            AtomicBool,
-            Ordering,
-        },
-        Arc,
-        Weak,
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
     },
 };
-use super::ImportDma;
 #[allow(unused_imports)]
-use tracing::{
-    trace,
-    debug,
-    error,
-    warn,
-};
-use scopeguard::ScopeGuard;
+use tracing::{debug, error, trace, warn};
 
 mod dmabuf;
 mod util;
@@ -91,29 +72,28 @@ impl VulkanRenderer {
     ///
     /// The [`PhysicalDevice`] must be on an api version greater than or equal to Vulkan 1.1
     pub fn new(phd: &PhysicalDevice) -> Result<Self, Error<'static>> {
-        let queue_family_idx = phd.graphics_queue_family()
-            .ok_or(Error::NoGraphicsQueue)?;
+        let queue_family_idx = phd.graphics_queue_family().ok_or(Error::NoGraphicsQueue)?;
         let priorities = [0.0];
-        let queue_info = [
-            vk::DeviceQueueCreateInfo::builder()
-                .queue_family_index(queue_family_idx as u32)
-                .queue_priorities(&priorities)
-                .build(),
-        ];
+        let queue_info = [vk::DeviceQueueCreateInfo::builder()
+            .queue_family_index(queue_family_idx as u32)
+            .queue_priorities(&priorities)
+            .build()];
         let create_info = vk::DeviceCreateInfo::builder()
             .enabled_extension_names(Self::required_extensions(phd))
             .queue_create_infos(&queue_info);
         let node = phd
-            .render_node().ok().flatten()
+            .render_node()
+            .ok()
+            .flatten()
             .or_else(|| phd.primary_node().ok().flatten());
         let instance = phd.instance().handle();
-        let device = unsafe {
-            instance.create_device(phd.handle(), &create_info, None)
-        }.map_or_else(
-            |e| Err(Error::Vk {
-                context: "vkCreateDevice",
-                result: e,
-            }),
+        let device = unsafe { instance.create_device(phd.handle(), &create_info, None) }.map_or_else(
+            |e| {
+                Err(Error::Vk {
+                    context: "vkCreateDevice",
+                    result: e,
+                })
+            },
             |d| Ok(Device(d)),
         )?;
 
@@ -121,28 +101,29 @@ impl VulkanRenderer {
             .flags(vk::DeviceQueueCreateFlags::empty())
             .queue_family_index(queue_family_idx as _)
             .queue_index(0);
-        let queue = unsafe {
-            device.get_device_queue2(&queue_info)
-        };
+        let queue = unsafe { device.get_device_queue2(&queue_info) };
 
         let extensions = Extensions::new(instance, &device);
 
-        let formats: HashMap<_, _> = FormatInfo::get_known(phd)
-            .map(|f| (f.drm, f))
-            .collect();
-        let dmabuf_formats = formats.iter()
-            .flat_map(|(_, &FormatInfo { drm, ref modifiers, .. })| {
-                modifiers.iter()
-                    .map(move |v| DrmFormat {
+        let formats: HashMap<_, _> = FormatInfo::get_known(phd).map(|f| (f.drm, f)).collect();
+        let dmabuf_formats = formats
+            .iter()
+            .flat_map(
+                |(
+                    _,
+                    &FormatInfo {
+                        drm, ref modifiers, ..
+                    },
+                )| {
+                    modifiers.iter().map(move |v| DrmFormat {
                         code: drm,
                         modifier: DrmModifier::from(v.drm_format_modifier),
                     })
-            })
+                },
+            )
             .collect::<Vec<_>>();
 
-        let memory_props = unsafe {
-            instance.get_physical_device_memory_properties(phd.handle())
-        };
+        let memory_props = unsafe { instance.get_physical_device_memory_properties(phd.handle()) };
 
         let device = Arc::new(device);
 
@@ -151,21 +132,22 @@ impl VulkanRenderer {
             .queue_family_index(queue_family_idx as _)
             .build();
         let pool = unsafe {
-            device.create_command_pool(&pool_info, None)
+            device
+                .create_command_pool(&pool_info, None)
                 .or_else(|_| {
                     pool_info.flags = vk::CommandPoolCreateFlags::empty();
                     device.create_command_pool(&pool_info, None)
                 })
                 .map(|v| OwnedHandle::from_arc(v, &device))
-        }.vk("vkCreateCommandPool")?;
+        }
+        .vk("vkCreateCommandPool")?;
 
         let cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::builder()
             .command_pool(*pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(DEFAULT_COMMAND_BUFFERS as _);
-        let cmd_buffers = unsafe {
-            device.allocate_command_buffers(&cmd_buf_alloc_info)
-        }.vk("vkAllocateCommandBuffers")?;
+        let cmd_buffers =
+            unsafe { device.allocate_command_buffers(&cmd_buf_alloc_info) }.vk("vkAllocateCommandBuffers")?;
 
         let cmd_buffer_usage = {
             let mut ret = Vec::with_capacity(cmd_buffers.len());
@@ -231,9 +213,10 @@ impl VulkanRenderer {
     }
 
     fn format_for_drm(&self, format: &DrmFormat) -> Option<Format> {
-        let &DrmFormat { code , modifier } = format;
+        let &DrmFormat { code, modifier } = format;
         self.formats.get(&code).and_then(|info| {
-            info.modifiers.iter()
+            info.modifiers
+                .iter()
                 .find(|v| modifier == v.drm_format_modifier)
                 .map(|mod_props| Format {
                     vk: info.vk,
@@ -248,15 +231,18 @@ impl VulkanRenderer {
         type_mask: u32,
         props: vk::MemoryPropertyFlags,
     ) -> Option<(usize, &vk::MemoryType)> {
-        self.memory_props.memory_types.iter()
+        self.memory_props
+            .memory_types
+            .iter()
             .enumerate()
             .filter(|&(idx, ..)| (type_mask & (0b1 << idx)) != 0)
             .find(|(_idx, ty)| (ty.property_flags & props) == props)
     }
 
     #[inline(always)]
-    fn command_buffers(&self) -> impl Iterator<Item=(vk::CommandBuffer, &AtomicBool)> {
-        self.command_buffers.iter()
+    fn command_buffers(&self) -> impl Iterator<Item = (vk::CommandBuffer, &AtomicBool)> {
+        self.command_buffers
+            .iter()
             .copied()
             .zip(&*self.command_buffer_usage)
     }
@@ -264,7 +250,11 @@ impl VulkanRenderer {
     /// TODO: verify this AtomicBool logic and ordering w/ [`CommandBuffer::drop`]
     fn acquire_command_buffer(&self) -> Result<CommandBuffer<'_>, Error<'static>> {
         self.command_buffers()
-            .find(|&(_buf, in_use)| in_use.compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire).is_ok())
+            .find(|&(_buf, in_use)| {
+                in_use
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
+                    .is_ok()
+            })
             .map(CommandBuffer::from)
             .ok_or(Error::AllCommandBuffersBusy)
     }
@@ -275,12 +265,12 @@ impl Drop for VulkanRenderer {
         // TODO: consider moving this into some kind of wrapper?
         unsafe {
             if self.command_buffers.len() > 0 && self.command_buffers.iter().any(|&buf| !buf.is_null()) {
-                self.device.free_command_buffers(*self.command_pool, &self.command_buffers);
+                self.device
+                    .free_command_buffers(*self.command_pool, &self.command_buffers);
             }
         }
     }
 }
-
 
 macro_rules! vk_call {
     ($e:expr, $fname:expr) => {
@@ -298,16 +288,10 @@ impl Renderer for VulkanRenderer {
         let device: &ash::Device = &self.device;
         device.handle().as_raw() as usize
     }
-    fn downscale_filter(
-        &mut self,
-        _filter: TextureFilter
-    ) -> Result<(), Self::Error> {
+    fn downscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
         todo!()
     }
-    fn upscale_filter(
-        &mut self,
-        _filter: TextureFilter
-    ) -> Result<(), Self::Error> {
+    fn upscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
         todo!()
     }
     fn set_debug_flags(&mut self, flags: DebugFlags) {
@@ -320,7 +304,7 @@ impl Renderer for VulkanRenderer {
     fn render(
         &mut self,
         _output_size: Size<i32, Physical>,
-        _dst_transform: Transform
+        _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
         Ok(VulkanFrame {
             renderer: self,
@@ -342,13 +326,11 @@ impl ImportDma for VulkanRenderer {
     fn import_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
-        _damage: Option<&[Rectangle<i32, BufferCoord>]>
+        _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
         use dmabuf::*;
-        const USAGE_FLAGS: vk::ImageUsageFlags =
-            vk::ImageUsageFlags::SAMPLED;
-        const H_TYPE: vk::ExternalMemoryHandleTypeFlags =
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        const USAGE_FLAGS: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
+        const H_TYPE: vk::ExternalMemoryHandleTypeFlags = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
         const ALL_PLANE_ASPECTS: [vk::ImageAspectFlags; MAX_PLANES] = [
             vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
             vk::ImageAspectFlags::MEMORY_PLANE_1_EXT,
@@ -356,17 +338,19 @@ impl ImportDma for VulkanRenderer {
             vk::ImageAspectFlags::MEMORY_PLANE_3_EXT,
         ];
 
-        if let Some(existing) = self.dmabuf_cache
+        if let Some(existing) = self
+            .dmabuf_cache
             .get_key_value(&dmabuf.weak())
             .and_then(|(weak, img)| {
-                weak.upgrade()
-                    .filter(|buf| buf == dmabuf)?;
+                weak.upgrade().filter(|buf| buf == dmabuf)?;
                 Some(img.clone())
-            }) {
+            })
+        {
             return Ok(existing);
         }
 
-        let fmt = self.format_for_drm(&dmabuf.format())
+        let fmt = self
+            .format_for_drm(&dmabuf.format())
             .ok_or(Error::UnknownFormat(dmabuf.format()))?;
 
         let disjoint = dmabuf.is_disjoint()?;
@@ -375,8 +359,7 @@ impl ImportDma for VulkanRenderer {
         } else {
             vk::ImageCreateFlags::empty()
         };
-        let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::builder()
-            .handle_type(H_TYPE);
+        let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::builder().handle_type(H_TYPE);
         let mut info = vk::PhysicalDeviceImageFormatInfo2::builder()
             .format(fmt.vk)
             .ty(vk::ImageType::TYPE_2D)
@@ -395,23 +378,22 @@ impl ImportDma for VulkanRenderer {
             info = info.push_next(&mut drm_info);
         }
         let mut external_fmt_props = vk::ExternalImageFormatProperties::default();
-        let mut image_fmt = vk::ImageFormatProperties2::builder()
-            .push_next(&mut external_fmt_props);
+        let mut image_fmt = vk::ImageFormatProperties2::builder().push_next(&mut external_fmt_props);
         let _image_fmt = unsafe {
-            self.instance().get_physical_device_image_format_properties2(
-                self.phd.handle(),
-                &info,
-                &mut image_fmt
-            ).vk("vkGetPhysicalDeviceImageFormatProperties2")?;
+            self.instance()
+                .get_physical_device_image_format_properties2(self.phd.handle(), &info, &mut image_fmt)
+                .vk("vkGetPhysicalDeviceImageFormatProperties2")?;
             let image_fmt_props = image_fmt.image_format_properties;
-            trace!("vkGetPhysicalDeviceImageFormatProperties2:\n{:#?}", &image_fmt_props);
+            trace!(
+                "vkGetPhysicalDeviceImageFormatProperties2:\n{:#?}",
+                &image_fmt_props
+            );
             image_fmt_props
         };
 
         let mut drm_info: vk::ImageDrmFormatModifierExplicitCreateInfoEXTBuilder<'_>;
         let mut plane_layouts: Vec<vk::SubresourceLayout>;
-        let mut external_info = vk::ExternalMemoryImageCreateInfo::builder()
-            .handle_types(H_TYPE);
+        let mut external_info = vk::ExternalMemoryImageCreateInfo::builder().handle_types(H_TYPE);
         let extent @ vk::Extent3D { width, height, .. } = dmabuf.extent_3d();
         let mut info = vk::ImageCreateInfo::builder()
             .push_next(&mut external_info)
@@ -429,7 +411,8 @@ impl ImportDma for VulkanRenderer {
             .initial_layout(vk::ImageLayout::UNDEFINED);
         if let Some(mod_info) = fmt.modifier.as_ref() {
             plane_layouts = Vec::with_capacity(dmabuf.num_planes());
-            let it = dmabuf.offsets()
+            let it = dmabuf
+                .offsets()
                 .zip(dmabuf.strides())
                 .map(|(offset, stride)| vk::SubresourceLayout {
                     offset: offset as _,
@@ -444,20 +427,24 @@ impl ImportDma for VulkanRenderer {
                 .plane_layouts(plane_layouts.as_slice());
             info = info.push_next(&mut drm_info);
         }
-        let image = unsafe {
-            self.device.create_image(&info, None)
-        }.map_or_else(
-            |e| Err(Error::Vk {
-                context: "vkCreateImage",
-                result: e,
-            }),
-            |img| Ok(scopeguard::guard(img, |img| unsafe {
-                self.device.destroy_image(img, None);
-            }))
+        let image = unsafe { self.device.create_image(&info, None) }.map_or_else(
+            |e| {
+                Err(Error::Vk {
+                    context: "vkCreateImage",
+                    result: e,
+                })
+            },
+            |img| {
+                Ok(scopeguard::guard(img, |img| unsafe {
+                    self.device.destroy_image(img, None);
+                }))
+            },
         )?;
         trace!("imported VkImage: {:?}", &image);
 
-        let memory_plane_props = self.extensions.external_memory_fd
+        let memory_plane_props = self
+            .extensions
+            .external_memory_fd
             .dmabuf_memory_properties(dmabuf)
             .map_err(|e| Error::Vk {
                 context: "get dmabuf fd memory properties",
@@ -477,29 +464,27 @@ impl ImportDma for VulkanRenderer {
                 }
             }
         });
-        memory_plane_props.into_iter()
+        memory_plane_props
+            .into_iter()
             .enumerate()
             .zip(memories.iter_mut())
             .take(mem_count)
             .try_for_each(|((idx, (fd, props)), dm)| -> Result<_, Error<'static>> {
-                let mem_reqs = self.device.get_memory_requirements(
-                    *image,
-                    ALL_PLANE_ASPECTS[idx],
-                    disjoint
-                ).memory_requirements;
-                let mem_type_bits =
-                    props.memory_type_bits & mem_reqs.memory_type_bits;
-                let (mem_idx, ..) = self.find_memory_type(
-                    mem_type_bits,
-                    vk::MemoryPropertyFlags::empty(),
-                ).ok_or(DmabufError::NoMemoryType(mem_type_bits))?;
-                let fd = fd.try_clone_to_owned()
+                let mem_reqs = self
+                    .device
+                    .get_memory_requirements(*image, ALL_PLANE_ASPECTS[idx], disjoint)
+                    .memory_requirements;
+                let mem_type_bits = props.memory_type_bits & mem_reqs.memory_type_bits;
+                let (mem_idx, ..) = self
+                    .find_memory_type(mem_type_bits, vk::MemoryPropertyFlags::empty())
+                    .ok_or(DmabufError::NoMemoryType(mem_type_bits))?;
+                let fd = fd
+                    .try_clone_to_owned()
                     .map_err(|e| Error::from(DmabufError::Io(e)))?;
                 let mut import_info = vk::ImportMemoryFdInfoKHR::builder()
                     .handle_type(H_TYPE)
                     .fd(fd.as_raw_fd());
-                let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::builder()
-                    .image(*image);
+                let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::builder().image(*image);
                 let create_info = vk::MemoryAllocateInfo::builder()
                     .allocation_size(mem_reqs.size)
                     .memory_type_index(mem_idx as _)
@@ -528,7 +513,11 @@ impl ImportDma for VulkanRenderer {
                 Ok(())
             })?;
         let mems = &memories[..mem_count];
-        trace!("import_dmabuf: imported device memories[{}]:\n{:#?}", mems.len(), mems);
+        trace!(
+            "import_dmabuf: imported device memories[{}]:\n{:#?}",
+            mems.len(),
+            mems
+        );
 
         vk_call!(
             self.device.bind_image_memory2(&bind_infos[..mems.len()]),
@@ -579,18 +568,14 @@ impl<'a> Frame for VulkanFrame<'a> {
     fn id(&self) -> usize {
         self.renderer.id()
     }
-    fn clear(
-        &mut self,
-        _color: [f32; 4],
-        _at: &[Rectangle<i32, Physical>]
-    ) -> Result<(), Self::Error> {
+    fn clear(&mut self, _color: [f32; 4], _at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
         todo!()
     }
     fn draw_solid(
         &mut self,
         _dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
-        _color: [f32; 4]
+        _color: [f32; 4],
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -601,7 +586,7 @@ impl<'a> Frame for VulkanFrame<'a> {
         _dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
         _src_transform: Transform,
-        _alpha: f32
+        _alpha: f32,
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -664,7 +649,11 @@ impl Drop for InnerImage {
         };
         unsafe {
             device.destroy_image(self.image, None);
-            for &mem in self.memories.iter().filter(|&&mem| mem != vk::DeviceMemory::null()) {
+            for &mem in self
+                .memories
+                .iter()
+                .filter(|&&mem| mem != vk::DeviceMemory::null())
+            {
                 device.free_memory(mem, None);
             }
         }
@@ -702,33 +691,21 @@ struct FormatInfo {
 }
 
 impl FormatInfo {
-    fn get_known(phd: &PhysicalDevice) -> impl Iterator<Item=Self> + '_ {
+    fn get_known(phd: &PhysicalDevice) -> impl Iterator<Item = Self> + '_ {
         use crate::backend::allocator::vulkan::format;
-        format::known_vk_formats().map(|(fourcc, vk_format)| {
-            Self::new(phd, fourcc, vk_format)
-        })
+        format::known_vk_formats().map(|(fourcc, vk_format)| Self::new(phd, fourcc, vk_format))
     }
     fn new(phd: &PhysicalDevice, fourcc: Fourcc, vk_format: vk::Format) -> Self {
         let instance = phd.instance().handle();
         let mut mod_list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut props = vk::FormatProperties2::builder()
-            .push_next(&mut mod_list)
-            .build();
+        let mut props = vk::FormatProperties2::builder().push_next(&mut mod_list).build();
         unsafe {
-            instance.get_physical_device_format_properties2(
-                phd.handle(),
-                vk_format,
-                &mut props
-            );
+            instance.get_physical_device_format_properties2(phd.handle(), vk_format, &mut props);
         }
         let mut mod_props = Vec::with_capacity(mod_list.drm_format_modifier_count as _);
         mod_list.p_drm_format_modifier_properties = mod_props.as_mut_ptr();
         unsafe {
-            instance.get_physical_device_format_properties2(
-                phd.handle(),
-                vk_format,
-                &mut props
-            );
+            instance.get_physical_device_format_properties2(phd.handle(), vk_format, &mut props);
             mod_props.set_len(mod_list.p_drm_format_modifier_properties as _);
         }
         FormatInfo {
@@ -750,7 +727,8 @@ impl PdExt for PhysicalDevice {
                 .handle()
                 .get_physical_device_queue_family_properties(self.handle())
         };
-        queue_families.iter()
+        queue_families
+            .iter()
             .position(|props| props.queue_flags.contains(vk::QueueFlags::GRAPHICS))
     }
 }
@@ -779,9 +757,7 @@ impl DerefMut for Device {
 }
 impl fmt::Debug for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Device")
-            .field(&self.0.handle())
-            .finish()
+        f.debug_tuple("Device").field(&self.0.handle()).finish()
     }
 }
 
@@ -869,7 +845,7 @@ trait DeviceExt {
     fn disjoint_memory_requirements(
         &self,
         image: vk::Image,
-        plane_aspect: vk::ImageAspectFlags
+        plane_aspect: vk::ImageAspectFlags,
     ) -> vk::MemoryRequirements2;
 
     #[inline(always)]
@@ -877,7 +853,7 @@ trait DeviceExt {
         &self,
         image: vk::Image,
         plane_aspect: vk::ImageAspectFlags,
-        disjoint: bool
+        disjoint: bool,
     ) -> vk::MemoryRequirements2 {
         if disjoint {
             self.disjoint_memory_requirements(image, plane_aspect)
@@ -893,8 +869,7 @@ trait DeviceExt {
 }
 impl DeviceExt for ash::Device {
     fn memory_requirements(&self, image: vk::Image) -> vk::MemoryRequirements2 {
-        let info = vk::ImageMemoryRequirementsInfo2::builder()
-            .image(image);
+        let info = vk::ImageMemoryRequirementsInfo2::builder().image(image);
         let mut ret = vk::MemoryRequirements2::default();
         unsafe {
             self.get_image_memory_requirements2(&info, &mut ret);
@@ -904,10 +879,9 @@ impl DeviceExt for ash::Device {
     fn disjoint_memory_requirements(
         &self,
         image: vk::Image,
-        plane_aspect: vk::ImageAspectFlags
+        plane_aspect: vk::ImageAspectFlags,
     ) -> vk::MemoryRequirements2 {
-        let mut info_plane = vk::ImagePlaneMemoryRequirementsInfo::builder()
-            .plane_aspect(plane_aspect);
+        let mut info_plane = vk::ImagePlaneMemoryRequirementsInfo::builder().plane_aspect(plane_aspect);
         let info = vk::ImageMemoryRequirementsInfo2::builder()
             .push_next(&mut info_plane)
             .image(image);
@@ -954,7 +928,11 @@ impl<'a> Drop for CommandBuffer<'a> {
         // in debug mode, use `compare_exchange` to ensure the value was previously `true`
         #[cfg(debug_assertions)]
         {
-            assert_eq!(self.in_use.compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire), Ok(true))
+            assert_eq!(
+                self.in_use
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire),
+                Ok(true)
+            )
         }
     }
 }

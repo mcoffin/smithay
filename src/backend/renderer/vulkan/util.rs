@@ -1,17 +1,11 @@
-use ash::{
-    vk,
-    extensions::khr::ExternalMemoryFd,
-};
+use super::MAX_PLANES;
 use crate::backend::allocator::dmabuf::Dmabuf;
+use ash::{extensions::khr::ExternalMemoryFd, vk};
 use std::{
     fmt,
     ops::Deref,
-    os::fd::{
-        BorrowedFd,
-        AsRawFd,
-    },
+    os::fd::{AsRawFd, BorrowedFd},
 };
-use super::MAX_PLANES;
 
 #[derive(Clone, Copy)]
 pub struct DerefSliceIter<T> {
@@ -82,7 +76,8 @@ impl<'a> IntoIterator for DmabufMemoryProperties<'a> {
     type IntoIter = std::iter::Take<std::array::IntoIter<(BorrowedFd<'a>, vk::MemoryFdPropertiesKHR), 4>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.props.into_iter()
+        self.props
+            .into_iter()
             .take(std::cmp::min(self.len(), self.props.len()))
     }
 }
@@ -94,21 +89,22 @@ impl<'a> fmt::Debug for DmabufMemoryProperties<'a> {
 }
 
 pub trait ExternalMemoryFdExt {
-    fn dmabuf_memory_properties<'a>(&self, buffer: &'a Dmabuf) -> Result<DmabufMemoryProperties<'a>, vk::Result>;
+    fn dmabuf_memory_properties<'a>(
+        &self,
+        buffer: &'a Dmabuf,
+    ) -> Result<DmabufMemoryProperties<'a>, vk::Result>;
 }
 impl ExternalMemoryFdExt for ExternalMemoryFd {
-    fn dmabuf_memory_properties<'a>(&self, buffer: &'a Dmabuf) -> Result<DmabufMemoryProperties<'a>, vk::Result> {
-        const HTYPE: vk::ExternalMemoryHandleTypeFlags =
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
-        let default_value = unsafe {
-            (BorrowedFd::borrow_raw(0), vk::MemoryFdPropertiesKHR::default())
-        };
+    fn dmabuf_memory_properties<'a>(
+        &self,
+        buffer: &'a Dmabuf,
+    ) -> Result<DmabufMemoryProperties<'a>, vk::Result> {
+        const HTYPE: vk::ExternalMemoryHandleTypeFlags = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        let default_value = unsafe { (BorrowedFd::borrow_raw(0), vk::MemoryFdPropertiesKHR::default()) };
         let mut ret = [default_value; MAX_PLANES];
         let mut count = 0usize;
         for (fd, out) in buffer.handles().take(MAX_PLANES).zip(ret.iter_mut()) {
-            let props = unsafe {
-                self.get_memory_fd_properties(HTYPE, fd.as_raw_fd())
-            }?;
+            let props = unsafe { self.get_memory_fd_properties(HTYPE, fd.as_raw_fd()) }?;
             *out = (fd, props);
             count += 1;
         }

@@ -1,13 +1,8 @@
+use crate::backend::allocator::dmabuf::Dmabuf;
 use std::{
     io,
-    os::fd::{
-        BorrowedFd,
-        AsRawFd,
-        FromRawFd,
-        IntoRawFd,
-    },
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd},
 };
-use crate::backend::allocator::dmabuf::Dmabuf;
 
 pub trait DmabufExt {
     /// Uses inode id to determine if all planes of a dmabuf belong to the same memory allocation
@@ -16,10 +11,7 @@ pub trait DmabufExt {
 
 impl DmabufExt for Dmabuf {
     fn is_disjoint(&self) -> Result<bool, DmabufError> {
-        use std::{
-            os::linux::fs::MetadataExt,
-            fs,
-        };
+        use std::{fs, os::linux::fs::MetadataExt};
         /// Allows retrieval of [`fs::Metadata`] without having to duplicate a [`BorrowedFd`]
         trait BorrowedFdExt {
             fn metadata(&self) -> io::Result<fs::Metadata>;
@@ -28,9 +20,7 @@ impl DmabufExt for Dmabuf {
             fn metadata(&self) -> io::Result<fs::Metadata> {
                 // Safe as long as we're *damn* sure that we re-take ownership during our borrow of the fd,
                 // and before the [`fs::File`] is dropped
-                let f = unsafe {
-                    fs::File::from_raw_fd(self.as_raw_fd())
-                };
+                let f = unsafe { fs::File::from_raw_fd(self.as_raw_fd()) };
                 let ret = f.metadata();
                 // since we don't *actually* own the file descriptor, take "ownership" back so that
                 // dropping the file doesn't close the fd
@@ -44,11 +34,9 @@ impl DmabufExt for Dmabuf {
         } else {
             return Err(DmabufError::NoPlanes);
         };
-        let last_ino = first_fd.metadata()
-            .map(|info| info.st_ino())?;
+        let last_ino = first_fd.metadata().map(|info| info.st_ino())?;
         for fd in it {
-            let ino = fd.metadata()
-                .map(|info| info.st_ino())?;
+            let ino = fd.metadata().map(|info| info.st_ino())?;
             if ino != last_ino {
                 return Ok(true);
             }

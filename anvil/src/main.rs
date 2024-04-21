@@ -62,18 +62,18 @@ fn main() {
         (Backend::Winit, Renderer::Gles) => {
             tracing::info!("Starting anvil with winit/gles backend");
             anvil::winit::run_winit_gles();
-        },
+        }
         (Backend::Winit, Renderer::Vulkan) => {
             tracing::info!("Starting anvil with winit/vulkan backend");
             anvil::winit::run_winit_vulkan();
-        },
+        }
         (Backend::Udev, ..) => {
             tracing::info!("Starting anvil on a tty using udev");
             anvil::udev::run_udev();
-        },
+        }
         (Backend::X11, ..) => {
             tracing::info!("Starting anvil with x11 backend");
             anvil::x11::run_x11();
-        },
+        }
     }
 }

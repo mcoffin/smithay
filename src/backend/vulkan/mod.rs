@@ -90,14 +90,11 @@ use self::{inner::InstanceInner, version::Version};
 #[cfg(feature = "backend_drm")]
 use super::drm::DrmNode;
 
-pub mod util;
 pub mod native;
 mod surface;
+pub mod util;
+use native::{TryVulkanNativeWindow, VulkanNativeWindow};
 pub use surface::Surface;
-use native::{
-    TryVulkanNativeWindow,
-    VulkanNativeWindow,
-};
 mod inner;
 mod phd;
 
@@ -184,26 +181,17 @@ impl Instance {
     ///
     /// * Safe as long as [`VulkanNativeWindow::required_extensions`] follows the rules outlined
     ///   in [`Instance::with_extensions`]
-    pub fn with_window<W>(
-        app_info: Option<AppInfo>,
-        window: &W,
-    ) -> Result<(Instance, Surface), InstanceError>
+    pub fn with_window<W>(app_info: Option<AppInfo>, window: &W) -> Result<(Instance, Surface), InstanceError>
     where
         W: TryVulkanNativeWindow,
     {
-        let window = window.vulkan_native_window()
-            .ok_or(InstanceError::Window)?;
-        let instance = unsafe {
-            Self::with_extensions(
-                Version::VERSION_1_3,
-                app_info,
-                window.required_extensions(),
-            )
-        }?;
-        let entry: &ash::Entry = LIBRARY.as_ref()
-            .map_err(|&e| e)?;
+        let window = window.vulkan_native_window().ok_or(InstanceError::Window)?;
+        let instance =
+            unsafe { Self::with_extensions(Version::VERSION_1_3, app_info, window.required_extensions()) }?;
+        let entry: &ash::Entry = LIBRARY.as_ref().map_err(|&e| e)?;
         let surface_ext = VkSurface::new(entry, instance.handle());
-        let surface = window.create_surface(entry, instance.handle())
+        let surface = window
+            .create_surface(entry, instance.handle())
             .map(|surface| Surface::new(surface_ext, surface))?;
         Ok((instance, surface))
     }
@@ -767,7 +755,7 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => error!(ty, "{}", message),
             _ => {
                 panic!("unknown debug message severity: {:?}", message_severity);
-            },
+            }
         }
     });
 

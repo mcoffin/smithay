@@ -1,12 +1,6 @@
-use ash::{
-    vk,
-    extensions::khr::Surface as VkSurface,
-};
 use super::Instance;
-use std::{
-    fmt,
-    ops::Deref,
-};
+use ash::{extensions::khr::Surface as VkSurface, vk};
+use std::{fmt, ops::Deref};
 
 pub struct Surface {
     handle: vk::SurfaceKHR,
@@ -23,14 +17,8 @@ impl Drop for Surface {
 
 impl Surface {
     #[inline(always)]
-    pub fn new(
-        ext: VkSurface,
-        handle: vk::SurfaceKHR,
-    ) -> Self {
-        Surface {
-            handle,
-            surface: ext,
-        }
+    pub fn new(ext: VkSurface, handle: vk::SurfaceKHR) -> Self {
+        Surface { handle, surface: ext }
     }
     #[inline(always)]
     pub fn handle(&self) -> vk::SurfaceKHR {
@@ -53,8 +41,6 @@ impl Deref for Surface {
 
 impl fmt::Debug for Surface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Surface")
-            .field(&self.handle)
-            .finish()
+        f.debug_tuple("Surface").field(&self.handle).finish()
     }
 }

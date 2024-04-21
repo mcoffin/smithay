@@ -23,13 +23,7 @@ use smithay::{
             gles::GlesRenderer,
             ImportDma, ImportMemWl,
         },
-        winit::{
-            self,
-            WinitEvent,
-            WinitGraphicsBackend,
-            WinitGlesGraphics,
-            WinitNoGraphics,
-        },
+        winit::{self, WinitEvent, WinitGlesGraphics, WinitGraphicsBackend, WinitNoGraphics},
         SwapBuffersError,
     },
     delegate_dmabuf,
@@ -452,13 +446,12 @@ pub fn run_winit_vulkan() {
     // let mut display_handle = display.handle();
     use tracing::*;
 
-    let WinitNoGraphics(win, w_event_loop) = winit::init_no_graphics()
-        .expect("failed to initialize winit backend");
+    let WinitNoGraphics(win, w_event_loop) =
+        winit::init_no_graphics().expect("failed to initialize winit backend");
     info!("window: {:?}", &win);
 
     use smithay::backend::vulkan::Instance;
-    let (instance, surface) = Instance::with_window(None, &win)
-        .expect("failed to create vulkan instance");
+    let (instance, surface) = Instance::with_window(None, &win).expect("failed to create vulkan instance");
     info!("instance: {:?}", &instance);
 
     std::mem::drop(win);

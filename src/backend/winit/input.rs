@@ -190,8 +190,7 @@ impl PointerButtonEvent<WinitInput> for WinitMouseInputEvent {
             WinitMouseButton::Middle => 0x112,
             WinitMouseButton::Forward => 0x115,
             WinitMouseButton::Back => 0x116,
-            WinitMouseButton::Other(b) =>
-                self.input_platform.mouse_button_to_libinput(b as _),
+            WinitMouseButton::Other(b) => self.input_platform.mouse_button_to_libinput(b as _),
         }
     }
 
@@ -416,8 +415,7 @@ impl InputPlatform {
     #[inline(always)]
     fn mouse_button_to_libinput(&self, button: u32) -> u32 {
         match self {
-            InputPlatform::Xorg =>
-                input::xorg_mouse_to_libinput(button),
+            InputPlatform::Xorg => input::xorg_mouse_to_libinput(button),
             InputPlatform::Libinput => button,
         }
     }

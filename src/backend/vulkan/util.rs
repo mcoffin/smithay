@@ -1,10 +1,11 @@
+//! General utilites and abstraction for dealing with the vulkan graphics API
+//!
+//! Most interesting in here are shortcuts that make building RAII-style abstractions over vulkan
+//! types slightly easier (see [`OwnedHandle`] / [`ContextualHandle`]
 use std::{
     fmt,
     ops::Deref,
-    sync::{
-        Arc,
-        Weak,
-    },
+    sync::{Arc, Weak},
 };
 use tracing::error;
 
@@ -23,17 +24,14 @@ pub(crate) trait ContextualHandle: VulkanHandle + fmt::Debug {
 }
 
 #[derive(Debug)]
-pub(crate) struct OwnedHandle<
-    T: ContextualHandle<Context=C>,
-    C: fmt::Debug,
-> {
+pub(crate) struct OwnedHandle<T: ContextualHandle<Context = C>, C: fmt::Debug> {
     handle: T,
     context: Weak<C>,
 }
 
 impl<T, C> OwnedHandle<T, C>
 where
-    T: ContextualHandle<Context=C>,
+    T: ContextualHandle<Context = C>,
     C: fmt::Debug,
 {
     /// # Safety
@@ -41,10 +39,7 @@ where
     /// * `handle` must be valid for the lifetime of the object
     #[inline(always)]
     pub const unsafe fn new(handle: T, context: Weak<C>) -> Self {
-        OwnedHandle {
-            handle,
-            context,
-        }
+        OwnedHandle { handle, context }
     }
 
     #[inline(always)]
@@ -64,7 +59,7 @@ where
 
 impl<T, C> Deref for OwnedHandle<T, C>
 where
-    T: ContextualHandle<Context=C>,
+    T: ContextualHandle<Context = C>,
     C: fmt::Debug,
 {
     type Target = T;
@@ -76,7 +71,7 @@ where
 
 impl<T, C> Drop for OwnedHandle<T, C>
 where
-    T: ContextualHandle<Context=C>,
+    T: ContextualHandle<Context = C>,
     C: fmt::Debug,
 {
     fn drop(&mut self) {
@@ -94,7 +89,7 @@ where
 
 impl<T, C> PartialEq<T> for OwnedHandle<T, C>
 where
-    T: ContextualHandle<Context=C> + Eq,
+    T: ContextualHandle<Context = C> + Eq,
     C: fmt::Debug,
 {
     #[inline(always)]
