@@ -38,7 +38,7 @@ gl_generator = "0.14"
 
 [features]
 debug = ["fps_ticker", "image/png", "renderdoc"]
-default = ["egl", "winit", "x11", "udev", "xwayland"]
+default = ["egl", "winit", "x11", "udev", "xwayland", "renderer_vulkan"]
 egl = ["smithay/use_system_lib", "smithay/backend_egl"]
 test_all_features = ["default", "debug"]
 udev = [
@@ -63,3 +63,4 @@ profile-with-puffin = ["profiling/profile-with-puffin", "puffin_http"]
 profile-with-tracy = ["profiling/profile-with-tracy"]
 profile-with-tracy-mem = ["profile-with-tracy"]
 renderer_sync = []
+renderer_vulkan = ["smithay/renderer_vulkan"]

@@ -327,7 +327,7 @@ impl Error {
 #[derive(Debug)]
 pub struct WinitGraphicsBackend<G> {
     window: Arc<WinitWindow>,
-    graphics: G,
+    pub graphics: G,
     bound_size: Option<Size<i32, Physical>>,
     damage_tracking: bool,
     span: tracing::Span,
@@ -361,24 +361,27 @@ impl<G: WinitGraphics> WinitGraphicsBackend<G> {
     }
 
     /// Bind the underlying window to the renderer as it's target.
-    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[instrument(level = "trace", parent = &self.span, skip(self, convert_err))]
     #[profiling::function]
-    pub fn bind(&mut self) -> Result<(), SwapBuffersError>
+    pub fn bind<F>(&mut self, convert_err: F) -> Result<(), SwapBuffersError>
     where
         <G as WinitGraphics>::Renderer: Bind<<G as WinitGraphics>::Surface>,
         <G as WinitGraphics>::Surface: WinitSurface + Clone,
-        SwapBuffersError: From<<<G as WinitGraphics>::Renderer as Renderer>::Error>,
+        F: FnOnce(<<G as WinitGraphics>::Renderer as Renderer>::Error) -> SwapBuffersError,
+        // SwapBuffersError: From<<<G as WinitGraphics>::Renderer as Renderer>::Error>,
     {
         let win_size = self.window_size();
         let surface = self.graphics.surface().clone();
         if Some(win_size) != self.bound_size {
+            // TODO: upstream didn't actually respond to this
             self.graphics
                 .surface()
                 .resize(win_size.w, win_size.h, 0, 0)
                 .map_err(SwapBuffersError::temporary_failure)?;
         }
         self.bound_size = Some(win_size);
-        self.graphics.as_mut().bind(surface).map_err(From::from)
+        self.graphics.as_mut().bind(surface)
+            .map_err(convert_err)
     }
 
     /// Submits the back buffer to the window by swapping, requires the window to be previously

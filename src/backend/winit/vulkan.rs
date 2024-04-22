@@ -20,12 +20,14 @@ use std::{
     ffi::CStr, mem::drop, rc::Rc
 };
 
+type WinitVulkanBackend = WinitGraphicsBackend<WinitVulkanGraphics>;
+
 #[inline]
-pub fn init() -> Result<(WinitVulkanGraphics, WinitEventLoop), WinitError> {
+pub fn init() -> Result<(WinitVulkanBackend, WinitEventLoop), WinitError> {
     init_with_builder(builder())
 }
 
-pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanGraphics, WinitEventLoop), WinitError> {
+pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanBackend, WinitEventLoop), WinitError> {
     let span = info_span!("backend_winit", window = tracing::field::Empty);
     let _guard = span.enter();
     let (window, event_loop) = create_window(builder)?;
@@ -39,7 +41,13 @@ pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanGraphics,
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
     Ok((
-        vk_gfx,
+        WinitGraphicsBackend {
+            window: window.clone(),
+            graphics: vk_gfx,
+            bound_size: None,
+            damage_tracking: false,
+            span: span.clone(),
+        },
         WinitEventLoop::new(
             window,
             event_loop,
@@ -88,6 +96,11 @@ impl WinitVulkanGraphics {
     #[inline(always)]
     fn instance(&self) -> &Instance {
         self.physical_device.instance()
+    }
+
+    #[inline(always)]
+    pub fn physical_device(&self) -> &PhysicalDevice {
+        &self.physical_device
     }
 
     #[inline(always)]

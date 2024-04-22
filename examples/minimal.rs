@@ -221,7 +221,7 @@ fn run_winit(config: &Args) -> Result<(), Box<dyn std::error::Error>> {
             PumpStatus::Exit(_) => return Ok(()),
         };
 
-        backend.bind().unwrap();
+        backend.bind(From::from).unwrap();
 
         let size = backend.window_size();
         let damage = Rectangle::from_loc_and_size((0, 0), size);
