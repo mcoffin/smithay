@@ -1,7 +1,7 @@
-use super::Instance;
 use ash::{extensions::khr::Surface as VkSurface, vk};
 use std::{fmt, ops::Deref};
 
+/// *Owned* version of [`vk::SurfaceKHR`] that will be destroyed when dropped
 pub struct Surface {
     handle: vk::SurfaceKHR,
     surface: VkSurface,
@@ -20,6 +20,8 @@ impl Surface {
     pub fn new(ext: VkSurface, handle: vk::SurfaceKHR) -> Self {
         Surface { handle, surface: ext }
     }
+
+    /// Gives access to the raw vulkan handle value
     #[inline(always)]
     pub fn handle(&self) -> vk::SurfaceKHR {
         self.handle

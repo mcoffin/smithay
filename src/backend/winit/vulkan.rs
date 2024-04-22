@@ -1,1 +1,192 @@
+use ash::vk;
+use super::*;
+use super::Error as WinitError;
+use crate::backend::{
+    renderer::vulkan::{
+        Error as VkRendererError,
+        VulkanRenderer,
+        Device,
+        ErrorExt,
+    },
+    vulkan::{
+        Instance,
+        InstanceError,
+        PhysicalDevice,
+        Surface as VulkanSurface,
+        native::TryVulkanNativeWindow,
+    },
+};
+use std::{
+    ffi::CStr, mem::drop, rc::Rc
+};
 
+#[inline]
+pub fn init() -> Result<(WinitVulkanGraphics, WinitEventLoop), WinitError> {
+    init_with_builder(builder())
+}
+
+pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanGraphics, WinitEventLoop), WinitError> {
+    let span = info_span!("backend_winit", window = tracing::field::Empty);
+    let _guard = span.enter();
+    let (window, event_loop) = create_window(builder)?;
+    span.record("window", Into::<u64>::into(window.id()));
+    debug!("window created");
+
+    let vk_gfx = WinitVulkanGraphics::with_window(&window)?;
+
+    drop(_guard);
+
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
+    Ok((
+        vk_gfx,
+        WinitEventLoop::new(
+            window,
+            event_loop,
+            span
+        )
+    ))
+}
+
+/// [`WinitGraphics`] implementation details for a [`VulkanRenderer`]
+#[derive(Debug)]
+pub struct WinitVulkanGraphics {
+    renderer: VulkanRenderer,
+    physical_device: PhysicalDevice,
+    surface: Rc<VulkanSurface>,
+}
+
+impl WinitVulkanGraphics {
+    #[inline(always)]
+    fn new(pd: PhysicalDevice, surface: VulkanSurface) -> Result<Self, Error> {
+        VulkanRenderer::new(&pd)
+            .map(move |renderer| WinitVulkanGraphics {
+                renderer,
+                physical_device: pd,
+                surface: Rc::new(surface),
+            })
+            .map_err(Into::into)
+    }
+
+    /// Creates a new [`WinitVulkanGraphics`] based on a given window created by `winit`
+    pub(super) fn with_window(window: &WinitWindow) -> Result<Self, Error> {
+        let n_window = window.vulkan_native_window().ok_or(InstanceError::Window)?;
+        let (instance, surface) = Instance::with_window(None, window)?;
+        let window_exts = n_window.required_extensions();
+
+        // TODO: use drm node or something to make better choices here
+        let pd = instance.find_physical_device(
+            window_exts,
+            |pd| pd.properties().device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+        ).or_else(|_| {
+            instance.find_physical_device(window_exts, |_| true)
+        })?;
+
+        Self::new(pd, surface)
+    }
+
+    #[inline(always)]
+    fn instance(&self) -> &Instance {
+        self.physical_device.instance()
+    }
+
+    #[inline(always)]
+    fn device(&self) -> &ash::Device {
+        self.renderer.device()
+    }
+}
+
+impl WinitGraphics for WinitVulkanGraphics {
+    type Renderer = VulkanRenderer;
+    type Surface = Rc<VulkanSurface>;
+
+    #[inline(always)]
+    fn surface(&self) -> &Self::Surface {
+        &self.surface
+    }
+
+    fn submit(
+        &mut self,
+        _damage: Option<&mut [Rectangle<i32, Physical>]>,
+    ) -> Result<(), crate::backend::SwapBuffersError> {
+        todo!()
+    }
+}
+
+impl WinitSurface for Rc<VulkanSurface> {
+    type Error = VkRendererError<'static>;
+
+    fn resize(
+        &self,
+        _width: i32,
+        _height: i32,
+        _dx: i32,
+        _dy: i32
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
+}
+
+macro_rules! as_ref_mut {
+    ($t:ty { $($field:ident : $field_ty:ty),+ $(,)? }) => {
+        $(
+            impl AsRef<$field_ty> for $t {
+                #[inline(always)]
+                fn as_ref(&self) -> &$field_ty {
+                    &self.$field
+                }
+            }
+
+            impl AsMut<$field_ty> for $t {
+                fn as_mut(&mut self) -> &mut $field_ty {
+                    &mut self.$field
+                }
+            }
+        )+
+    };
+}
+
+as_ref_mut!(WinitVulkanGraphics {
+    renderer: VulkanRenderer,
+});
+
+trait InstanceExt {
+    fn find_physical_device<F>(
+        &self,
+        required_extensions: &[&CStr],
+        predicate: F
+    ) -> Result<PhysicalDevice, Error>
+    where
+        F: Fn(&PhysicalDevice) -> bool;
+}
+
+impl InstanceExt for Instance {
+    fn find_physical_device<F>(
+        &self,
+        required_extensions: &[&CStr],
+        predicate: F
+    ) -> Result<PhysicalDevice, Error>
+    where
+        F: Fn(&PhysicalDevice) -> bool,
+    {
+        PhysicalDevice::enumerate(self)
+            .vk("vkEnumeratePhysicalDevices")?
+            .filter(|pd| {
+                !required_extensions.iter()
+                    .copied()
+                    .any(|name| !pd.has_device_extension(name))
+            })
+            .find(predicate)
+            .ok_or(Error::NoSuitableDevice)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("error creating vulkan instance: {0}")]
+    Instance(#[from] InstanceError),
+    #[error("error setting up vulkan context: {0}")]
+    Renderer(#[from] VkRendererError<'static>),
+    #[error("no suitable physical device found")]
+    NoSuitableDevice,
+}

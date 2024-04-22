@@ -208,8 +208,13 @@ impl VulkanRenderer {
     }
 
     #[inline(always)]
-    fn instance(&self) -> &ash::Instance {
+    pub(crate) fn instance(&self) -> &ash::Instance {
         self.phd.instance().handle()
+    }
+
+    #[inline(always)]
+    pub(crate) fn device(&self) -> &ash::Device {
+        &self.device
     }
 
     fn format_for_drm(&self, format: &DrmFormat) -> Option<Format> {
@@ -312,6 +317,21 @@ impl Renderer for VulkanRenderer {
         })
     }
     fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+        todo!()
+    }
+}
+
+impl super::Bind<crate::backend::vulkan::Surface> for VulkanRenderer {
+    fn bind(
+        &mut self,
+        _target: crate::backend::vulkan::Surface
+    ) -> Result<(), <Self as Renderer>::Error> {
+        todo!()
+    }
+}
+
+impl super::Unbind for VulkanRenderer {
+    fn unbind(&mut self) -> Result<(), <Self as Renderer>::Error> {
         todo!()
     }
 }
@@ -809,7 +829,7 @@ impl<'a> Error<'a> {
 }
 
 /// Helper trait for [`VkResult`]
-trait ErrorExt {
+pub(crate) trait ErrorExt {
     type Ret;
     /// Helper function for converting [`VkResult`] values to [`Result`]s with the error as
     /// [`Error`]

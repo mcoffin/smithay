@@ -62,18 +62,13 @@ pub use self::input::*;
 #[cfg(feature = "renderer_vulkan")]
 mod vulkan;
 #[cfg(feature = "renderer_vulkan")]
-use crate::backend::renderer::vulkan::Error as VkRendererError;
+pub use vulkan::{
+    init as init_vulkan,
+    init_with_builder as init_with_builder_vulkan,
+};
 
 
 use super::renderer::Renderer;
-
-#[inline(always)]
-fn builder() -> WindowBuilder {
-    WindowBuilder::new()
-        .with_inner_size(LogicalSize::new(1280.0, 800.0))
-        .with_title("Smithay")
-        .with_visible(true)
-}
 
 /// Create a new [`WinitGraphicsBackend`], which implements the
 /// [`Renderer`] trait and a corresponding [`WinitEventLoop`].
@@ -125,11 +120,7 @@ impl TryFrom<WindowBuilder> for WinitNoGraphics {
         let _guard = span.enter();
         info!("Initializing a winit backend");
 
-        let event_loop = EventLoopBuilder::new()
-            .build()
-            .map_err(Error::EventLoopCreation)?;
-
-        let window = Arc::new(builder.build(&event_loop).map_err(Error::WindowCreation)?);
+        let (window, event_loop) = create_window(builder)?;
 
         span.record("window", Into::<u64>::into(window.id()));
         debug!("Window created");
@@ -274,6 +265,25 @@ where
     ))
 }
 
+#[inline(always)]
+fn builder() -> WindowBuilder {
+    WindowBuilder::new()
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_title("Smithay")
+        .with_visible(true)
+}
+
+#[inline]
+fn create_window(builder: WindowBuilder) -> Result<(Arc<WinitWindow>, EventLoop<()>), Error> {
+    let event_loop = EventLoopBuilder::new()
+        .build()
+        .map_err(Error::EventLoopCreation)?;
+    let window = builder.build(&event_loop)
+        .map(Arc::new)
+        .map_err(Error::WindowCreation)?;
+    Ok((window, event_loop))
+}
+
 /// Errors thrown by the `winit` backends
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -298,7 +308,7 @@ pub enum Error {
     #[cfg(feature = "renderer_vulkan")]
     #[doc = "Renderer initialization failed (vulkan)"]
     #[error("Vulkan Renderer creation falied: {0}")]
-    VkRendererCreation(#[from] VkRendererError<'static>),
+    Vulkan(#[from] vulkan::Error),
 }
 
 impl Error {
@@ -473,10 +483,7 @@ pub trait WinitSurface {
     fn resize(&self, width: i32, height: i32, dx: i32, dy: i32) -> Result<(), Self::Error>;
 }
 
-impl<T> WinitSurface for T
-where
-    T: Deref<Target = EGLSurface>,
-{
+impl WinitSurface for Rc<EGLSurface> {
     type Error = SurfaceError<'static>;
     #[inline]
     fn resize(&self, width: i32, height: i32, dx: i32, dy: i32) -> Result<(), Self::Error> {
@@ -679,6 +686,24 @@ pub struct WinitEventLoop {
 }
 
 impl WinitEventLoop {
+    #[inline(always)]
+    fn new(
+        window: Arc<WinitWindow>,
+        event_loop: Generic<EventLoop<()>>,
+        span: tracing::Span,
+    ) -> Self {
+        WinitEventLoop {
+            scale_factor: window.scale_factor(),
+            input_platform: window.input_platform(),
+            start_time: Instant::now(),
+            key_counter: 0,
+            fake_token: None,
+            event_loop,
+            window,
+            pending_events: Vec::new(),
+            span,
+        }
+    }
     /// Processes new events of the underlying event loop and calls the provided callback.
     ///
     /// You need to periodically call this function to keep the underlying event loop and
