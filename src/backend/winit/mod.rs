@@ -65,6 +65,7 @@ mod vulkan;
 pub use vulkan::{
     init as init_vulkan,
     init_with_builder as init_with_builder_vulkan,
+    WinitVulkanGraphics,
 };
 
 
@@ -72,7 +73,7 @@ use super::renderer::Renderer;
 
 /// Create a new [`WinitGraphicsBackend`], which implements the
 /// [`Renderer`] trait and a corresponding [`WinitEventLoop`].
-pub fn init<R>() -> Result<(WinitGraphicsBackend<WinitGlesGraphics<R>>, WinitEventLoop), Error>
+pub fn init<R>() -> Result<(WinitGraphicsBackend<WinitEglGraphics<R>>, WinitEventLoop), Error>
 where
     R: From<GlesRenderer> + Bind<Rc<EGLSurface>>,
     SwapBuffersError: From<<R as Renderer>::Error>,
@@ -85,7 +86,7 @@ where
 /// [`WinitEventLoop`].
 pub fn init_from_builder<R>(
     builder: WindowBuilder,
-) -> Result<(WinitGraphicsBackend<WinitGlesGraphics<R>>, WinitEventLoop), Error>
+) -> Result<(WinitGraphicsBackend<WinitEglGraphics<R>>, WinitEventLoop), Error>
 where
     R: From<GlesRenderer> + Bind<Rc<EGLSurface>>,
     SwapBuffersError: From<<R as Renderer>::Error>,
@@ -154,7 +155,7 @@ impl TryFrom<WindowBuilder> for WinitNoGraphics {
 pub fn init_from_builder_with_gl_attr<R>(
     builder: WindowBuilder,
     attributes: GlAttributes,
-) -> Result<(WinitGraphicsBackend<WinitGlesGraphics<R>>, WinitEventLoop), Error>
+) -> Result<(WinitGraphicsBackend<WinitEglGraphics<R>>, WinitEventLoop), Error>
 where
     R: From<GlesRenderer> + Bind<Rc<EGLSurface>>,
     SwapBuffersError: From<<R as Renderer>::Error>,
@@ -233,7 +234,7 @@ where
     Ok((
         WinitGraphicsBackend {
             window: window.clone(),
-            graphics: WinitGlesGraphics {
+            graphics: WinitEglGraphics {
                 renderer,
                 _display: display,
                 egl_surface: egl,
@@ -503,27 +504,27 @@ pub struct SurfaceError<'a>(&'a str);
 
 /// Container for the gles-specific items for [`WinitGraphics`]
 #[derive(Debug)]
-pub struct WinitGlesGraphics<R> {
+pub struct WinitEglGraphics<R> {
     renderer: R,
     _display: EGLDisplay,
     egl_surface: Rc<EGLSurface>,
 }
 
-impl<R> AsRef<R> for WinitGlesGraphics<R> {
+impl<R> AsRef<R> for WinitEglGraphics<R> {
     #[inline(always)]
     fn as_ref(&self) -> &R {
         &self.renderer
     }
 }
 
-impl<R> AsMut<R> for WinitGlesGraphics<R> {
+impl<R> AsMut<R> for WinitEglGraphics<R> {
     #[inline(always)]
     fn as_mut(&mut self) -> &mut R {
         &mut self.renderer
     }
 }
 
-impl<R> WinitGraphics for WinitGlesGraphics<R>
+impl<R> WinitGraphics for WinitEglGraphics<R>
 where
     R: Renderer + Bind<Rc<EGLSurface>>,
 {

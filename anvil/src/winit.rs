@@ -23,7 +23,15 @@ use smithay::{
             gles::GlesRenderer,
             ImportDma, ImportMemWl,
         },
-        winit::{self, WinitEvent, WinitGlesGraphics, WinitGraphicsBackend, WinitNoGraphics},
+        winit::{
+            self,
+            WinitEvent,
+            WinitGraphics,
+            WinitEglGraphics,
+            WinitVulkanGraphics,
+            WinitGraphicsBackend,
+            WinitNoGraphics
+        },
         SwapBuffersError,
     },
     delegate_dmabuf,
@@ -53,8 +61,8 @@ use crate::{drawing::*, render::*};
 
 pub const OUTPUT_NAME: &str = "winit";
 
-pub struct WinitData {
-    backend: WinitGraphicsBackend<WinitGlesGraphics<GlesRenderer>>,
+pub struct WinitData<G: WinitGraphics> {
+    backend: WinitGraphicsBackend<G>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     full_redraw: u8,
@@ -62,28 +70,43 @@ pub struct WinitData {
     pub fps: fps_ticker::Fps,
 }
 
-impl DmabufHandler for AnvilState<WinitData> {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.backend_data.dmabuf_state.0
-    }
+type WinitDataGles = WinitData<WinitEglGraphics<GlesRenderer>>;
+type WinitDataVulkan = WinitData<WinitVulkanGraphics>;
+// impl<G: WinitGraphics> DmabufHandler for AnvilState<WinitData<G>>
+//
+// where
+//     <G as WinitGraphics>::Renderer: ImportDma,
+// delegate_dmabuf!(AnvilState<WinitDataGles>);
+macro_rules! dmabuf_delegate {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl DmabufHandler for AnvilState<$t>
+            {
+                fn dmabuf_state(&mut self) -> &mut DmabufState {
+                    &mut self.backend_data.dmabuf_state.0
+                }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        if self
-            .backend_data
-            .backend
-            .renderer()
-            .import_dmabuf(&dmabuf, None)
-            .is_ok()
-        {
-            let _ = notifier.successful::<AnvilState<WinitData>>();
-        } else {
-            notifier.failed();
-        }
-    }
+                fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+                    if self
+                        .backend_data
+                        .backend
+                        .renderer()
+                        .import_dmabuf(&dmabuf, None)
+                        .is_ok()
+                    {
+                        let _ = notifier.successful::<AnvilState<$t>>();
+                    } else {
+                        notifier.failed();
+                    }
+                }
+            }
+        )+
+        delegate_dmabuf!($(AnvilState<$t>),+);
+    };
 }
-delegate_dmabuf!(AnvilState<WinitData>);
+dmabuf_delegate!(WinitDataGles, WinitDataVulkan);
 
-impl Backend for WinitData {
+impl<G: WinitGraphics> Backend for WinitData<G> {
     fn seat_name(&self) -> String {
         String::from("winit")
     }
@@ -122,7 +145,7 @@ pub fn run_winit_gles() {
             model: "Winit".into(),
         },
     );
-    let _global = output.create_global::<AnvilState<WinitData>>(&display.handle());
+    let _global = output.create_global::<AnvilState<WinitDataGles>>(&display.handle());
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
@@ -169,7 +192,7 @@ pub fn run_winit_gles() {
     // Note: egl on Mesa requires either v4 or wl_drm (initialized with bind_wl_display)
     let dmabuf_state = if let Some(default_feedback) = dmabuf_default_feedback {
         let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<AnvilState<WinitData>>(
+        let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<AnvilState<WinitDataGles>>(
             &display.handle(),
             &default_feedback,
         );
@@ -178,7 +201,7 @@ pub fn run_winit_gles() {
         let dmabuf_formats = backend.renderer().dmabuf_formats().collect::<Vec<_>>();
         let mut dmabuf_state = DmabufState::new();
         let dmabuf_global =
-            dmabuf_state.create_global::<AnvilState<WinitData>>(&display.handle(), dmabuf_formats);
+            dmabuf_state.create_global::<AnvilState<WinitDataGles>>(&display.handle(), dmabuf_formats);
         (dmabuf_state, dmabuf_global, None)
     };
 
