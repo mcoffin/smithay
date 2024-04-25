@@ -78,16 +78,14 @@ impl WinitVulkanGraphics {
 
     /// Creates a new [`WinitVulkanGraphics`] based on a given window created by `winit`
     pub(super) fn with_window(window: &WinitWindow) -> Result<Self, Error> {
-        let n_window = window.vulkan_native_window().ok_or(InstanceError::Window)?;
         let (instance, surface) = Instance::with_window(None, window)?;
-        let window_exts = n_window.required_extensions();
 
         // TODO: use drm node or something to make better choices here
         let pd = instance.find_physical_device(
-            window_exts,
+            &[],
             |pd| pd.properties().device_type == vk::PhysicalDeviceType::DISCRETE_GPU
         ).or_else(|_| {
-            instance.find_physical_device(window_exts, |_| true)
+            instance.find_physical_device(&[], |_| true)
         })?;
 
         Self::new(pd, surface)
@@ -131,12 +129,13 @@ impl WinitSurface for Rc<VulkanSurface> {
 
     fn resize(
         &self,
-        _width: i32,
-        _height: i32,
+        width: i32,
+        height: i32,
         _dx: i32,
         _dy: i32
     ) -> Result<(), Self::Error> {
-        todo!()
+        VulkanSurface::resize(self, width as _, height as _);
+        Ok(())
     }
 }
 

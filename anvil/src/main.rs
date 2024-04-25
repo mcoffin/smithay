@@ -63,6 +63,7 @@ fn main() {
             tracing::info!("Starting anvil with winit/gles backend");
             anvil::winit::run_winit_gles();
         }
+        #[cfg(feature = "renderer_vulkan")]
         (Backend::Winit, Renderer::Vulkan) => {
             tracing::info!("Starting anvil with winit/vulkan backend");
             anvil::winit::run_winit_vulkan();

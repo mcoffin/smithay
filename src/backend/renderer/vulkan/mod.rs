@@ -1,4 +1,4 @@
-use super::ImportDma;
+use super::{ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl};
 use crate::{
     backend::{
         allocator::{
@@ -38,8 +38,10 @@ use std::{
 use tracing::{debug, error, trace, warn};
 
 mod dmabuf;
+mod swapchain;
 mod util;
 use util::*;
+use swapchain::Swapchain;
 
 const DEFAULT_COMMAND_BUFFERS: usize = 4;
 
@@ -48,7 +50,7 @@ const DEFAULT_COMMAND_BUFFERS: usize = 4;
 pub struct VulkanRenderer {
     phd: PhysicalDevice,
     device: Arc<Device>,
-    queue: (usize, vk::Queue),
+    queues: QueueFamilies,
     _node: Option<DrmNode>,
     formats: HashMap<Fourcc, FormatInfo>,
     dmabuf_formats: Rc<[DrmFormat]>,
@@ -59,6 +61,9 @@ pub struct VulkanRenderer {
     command_pool: OwnedHandle<vk::CommandPool, Device>,
     command_buffers: Box<[vk::CommandBuffer]>,
     command_buffer_usage: Box<[AtomicBool]>,
+    target: Option<VulkanTarget>,
+    upscale_filter: vk::Filter,
+    downscale_filter: vk::Filter,
 }
 
 impl VulkanRenderer {
@@ -72,10 +77,10 @@ impl VulkanRenderer {
     ///
     /// The [`PhysicalDevice`] must be on an api version greater than or equal to Vulkan 1.1
     pub fn new(phd: &PhysicalDevice) -> Result<Self, Error<'static>> {
-        let queue_family_idx = phd.graphics_queue_family().ok_or(Error::NoGraphicsQueue)?;
+        let mut queues = QueueFamilies::try_from(phd)?;
         let priorities = [0.0];
         let queue_info = [vk::DeviceQueueCreateInfo::builder()
-            .queue_family_index(queue_family_idx as u32)
+            .queue_family_index(queues.graphics.index as u32)
             .queue_priorities(&priorities)
             .build()];
         let create_info = vk::DeviceCreateInfo::builder()
@@ -97,11 +102,7 @@ impl VulkanRenderer {
             |d| Ok(Device(d)),
         )?;
 
-        let queue_info = vk::DeviceQueueInfo2::builder()
-            .flags(vk::DeviceQueueCreateFlags::empty())
-            .queue_family_index(queue_family_idx as _)
-            .queue_index(0);
-        let queue = unsafe { device.get_device_queue2(&queue_info) };
+        queues.fill_device(&device);
 
         let extensions = Extensions::new(instance, &device);
 
@@ -129,7 +130,7 @@ impl VulkanRenderer {
 
         let mut pool_info = vk::CommandPoolCreateInfo::builder()
             .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(queue_family_idx as _)
+            .queue_family_index(queues.graphics.index as _)
             .build();
         let pool = unsafe {
             device
@@ -159,7 +160,7 @@ impl VulkanRenderer {
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
-            queue: (queue_family_idx, queue),
+            queues,
             _node: node,
             formats,
             dmabuf_formats: dmabuf_formats.into(),
@@ -170,6 +171,9 @@ impl VulkanRenderer {
             command_pool: pool,
             command_buffers: cmd_buffers.into(),
             command_buffer_usage: cmd_buffer_usage,
+            target: None,
+            upscale_filter: vk::Filter::LINEAR,
+            downscale_filter: vk::Filter::LINEAR,
         })
     }
 
@@ -186,6 +190,7 @@ impl VulkanRenderer {
         vk::ExtImageDrmFormatModifierFn::name().as_ptr(),
         vk::ExtExternalMemoryDmaBufFn::name().as_ptr(),
         vk::KhrExternalMemoryFdFn::name().as_ptr(),
+        vk::KhrSwapchainFn::name().as_ptr(),
         // < 1.2
         vk::KhrImageFormatListFn::name().as_ptr(),
     ];
@@ -196,12 +201,12 @@ impl VulkanRenderer {
     ///
     /// Uses [`PhysicalDevice::api_version`] to determine what is necessary to enable
     /// given the currently-in-use API version
-    fn required_extensions(phd: &PhysicalDevice) -> &'static [*const i8] {
+    pub fn required_extensions(phd: &PhysicalDevice) -> &'static [*const i8] {
         let v = phd.api_version();
         if v < Version::VERSION_1_1 {
             panic!("unsupported vulkan api version: {:?}", v);
         } else if v >= Version::VERSION_1_2 {
-            &Self::EXTS[..3]
+            &Self::EXTS[..4]
         } else {
             Self::EXTS
         }
@@ -283,6 +288,19 @@ macro_rules! vk_call {
     };
 }
 
+macro_rules! mocked {
+    () => {
+        warn!("mocked: {}", fn_name!());
+    };
+}
+
+const fn filter_to_vk(filter: TextureFilter) -> vk::Filter {
+    match filter {
+        TextureFilter::Linear => vk::Filter::LINEAR,
+        TextureFilter::Nearest => vk::Filter::NEAREST,
+    }
+}
+
 impl Renderer for VulkanRenderer {
     type Error = Error<'static>;
     type TextureId = VulkanImage;
@@ -293,11 +311,13 @@ impl Renderer for VulkanRenderer {
         let device: &ash::Device = &self.device;
         device.handle().as_raw() as usize
     }
-    fn downscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
-        todo!()
+    fn downscale_filter(&mut self, f: TextureFilter) -> Result<(), Self::Error> {
+        self.downscale_filter = filter_to_vk(f);
+        Ok(())
     }
-    fn upscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
-        todo!()
+    fn upscale_filter(&mut self, f: TextureFilter) -> Result<(), Self::Error> {
+        self.upscale_filter = filter_to_vk(f);
+        Ok(())
     }
     fn set_debug_flags(&mut self, flags: DebugFlags) {
         warn!("debug flags currently ignored: {:?}", flags);
@@ -313,6 +333,7 @@ impl Renderer for VulkanRenderer {
     ) -> Result<Self::Frame<'_>, Self::Error> {
         Ok(VulkanFrame {
             renderer: self,
+            target: self.target.as_ref().ok_or(Error::NoTarget)?,
             command_buffer: self.acquire_command_buffer()?,
         })
     }
@@ -321,18 +342,49 @@ impl Renderer for VulkanRenderer {
     }
 }
 
-impl super::Bind<crate::backend::vulkan::Surface> for VulkanRenderer {
+#[derive(Debug)]
+enum VulkanTarget {
+    Surface(Rc<crate::backend::vulkan::Surface>, Swapchain),
+}
+
+impl PartialEq<crate::backend::vulkan::Surface> for VulkanTarget {
+    fn eq(&self, rhs: &crate::backend::vulkan::Surface) -> bool {
+        match self {
+            VulkanTarget::Surface(surface, swapchain) => {
+                surface.handle() == rhs.handle() && swapchain.extent() == &rhs.extent()
+            },
+        }
+    }
+}
+
+impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
     fn bind(
         &mut self,
-        _target: crate::backend::vulkan::Surface
+        target: Rc<crate::backend::vulkan::Surface>,
     ) -> Result<(), <Self as Renderer>::Error> {
-        todo!()
+        match &self.target {
+            Some(tgt) if tgt == &*target => Ok(()),
+            _ => {
+                let surface = target.handle();
+                let swapchain = Swapchain::with_surface(
+                    &*self,
+                    target.handle(),
+                    target.extension(),
+                    &target.extent(),
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                )?;
+                debug!(?swapchain, ?surface, "created swapchain");
+                self.target = Some(VulkanTarget::Surface(target, swapchain));
+                Ok(())
+            },
+        }
     }
 }
 
 impl super::Unbind for VulkanRenderer {
     fn unbind(&mut self) -> Result<(), <Self as Renderer>::Error> {
-        todo!()
+        self.target = None;
+        Ok(())
     }
 }
 
@@ -388,7 +440,7 @@ impl ImportDma for VulkanRenderer {
             .flags(image_create_flags)
             .push_next(&mut external_info);
         let mut drm_info: vk::PhysicalDeviceImageDrmFormatModifierInfoEXT;
-        let queue_indices = [self.queue.0 as u32];
+        let queue_indices = [self.queues.graphics.index as u32];
         if let Some(mod_info) = fmt.modifier.as_ref() {
             drm_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::builder()
                 .drm_format_modifier(mod_info.drm_format_modifier)
@@ -565,12 +617,84 @@ impl ImportDma for VulkanRenderer {
     }
 }
 
+impl ImportDmaWl for VulkanRenderer {}
+
+const MEM_FORMATS: [Fourcc; 4] = [
+    Fourcc::Argb8888,
+    Fourcc::Xrgb8888,
+    Fourcc::Abgr8888,
+    Fourcc::Xbgr8888,
+];
+
+impl ImportMem for VulkanRenderer {
+    fn import_memory(
+        &mut self,
+        _data: &[u8],
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+        _flipped: bool,
+    ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
+        todo!()
+    }
+
+    fn update_memory(
+        &mut self,
+        _texture: &<Self as Renderer>::TextureId,
+        _data: &[u8],
+        _region: Rectangle<i32, BufferCoord>,
+    ) -> Result<(), <Self as Renderer>::Error> {
+        todo!()
+    }
+
+    fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+        Box::new(MEM_FORMATS.into_iter())
+    }
+}
+
+impl ImportMemWl for VulkanRenderer {
+    fn import_shm_buffer(
+        &mut self,
+        _buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
+        todo!()
+    }
+}
+
+impl ImportEgl for VulkanRenderer {
+    fn bind_wl_display(&mut self, _display: &wayland_server::DisplayHandle) -> Result<(), crate::backend::egl::Error> {
+        mocked!();
+        Ok(())
+    }
+
+    fn unbind_wl_display(&mut self) {
+        mocked!();
+    }
+
+    fn egl_reader(&self) -> Option<&crate::backend::egl::display::EGLBufferReader> {
+        mocked!();
+        None
+    }
+
+    fn import_egl_buffer(
+        &mut self,
+        _buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
+        // Err(Error::Unimplemented(fn_name!()))
+        unimplemented!()
+    }
+}
+
 /// [`Frame`] implementation used by a [`VulkanRenderer`]
 ///
 /// * See [`Renderer`] and [`Frame`]
 #[derive(Debug)]
 pub struct VulkanFrame<'a> {
     renderer: &'a VulkanRenderer,
+    target: &'a VulkanTarget,
     command_buffer: CommandBuffer<'a>,
 }
 
@@ -613,10 +737,10 @@ impl<'a> Frame for VulkanFrame<'a> {
     fn transformation(&self) -> Transform {
         Transform::Normal
     }
-    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+    fn finish(self) -> Result<SyncPoint, Self::Error> {
         todo!()
     }
-    fn finish(self) -> Result<SyncPoint, Self::Error> {
+    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
         todo!()
     }
 }
@@ -661,6 +785,14 @@ struct InnerImage {
     device: Weak<Device>,
 }
 
+impl InnerImage {
+    #[inline(always)]
+    fn memories(&self) -> impl Iterator<Item=&'_ vk::DeviceMemory> {
+        self.memories.iter()
+            .filter(|&&mem| mem != vk::DeviceMemory::null())
+    }
+}
+
 impl Drop for InnerImage {
     fn drop(&mut self) {
         let Some(device) = self.device.upgrade() else {
@@ -669,11 +801,7 @@ impl Drop for InnerImage {
         };
         unsafe {
             device.destroy_image(self.image, None);
-            for &mem in self
-                .memories
-                .iter()
-                .filter(|&&mem| mem != vk::DeviceMemory::null())
-            {
+            for &mem in self.memories() {
                 device.free_memory(mem, None);
             }
         }
@@ -726,7 +854,7 @@ impl FormatInfo {
         mod_list.p_drm_format_modifier_properties = mod_props.as_mut_ptr();
         unsafe {
             instance.get_physical_device_format_properties2(phd.handle(), vk_format, &mut props);
-            mod_props.set_len(mod_list.p_drm_format_modifier_properties as _);
+            mod_props.set_len(mod_list.drm_format_modifier_count as _);
         }
         FormatInfo {
             vk: vk_format,
@@ -737,19 +865,96 @@ impl FormatInfo {
     }
 }
 
-trait PdExt {
-    fn graphics_queue_family(&self) -> Option<usize>;
+
+#[derive(Debug)]
+struct QueueFamilies {
+    properties: Vec<vk::QueueFamilyProperties>,
+    graphics: Queue,
 }
-impl PdExt for PhysicalDevice {
-    fn graphics_queue_family(&self) -> Option<usize> {
-        let queue_families = unsafe {
-            self.instance()
+
+impl<'a> TryFrom<&'a PhysicalDevice> for QueueFamilies {
+    type Error = Error<'static>;
+    fn try_from(pd: &'a PhysicalDevice) -> Result<Self, Self::Error> {
+        let props = unsafe {
+            pd.instance()
                 .handle()
-                .get_physical_device_queue_family_properties(self.handle())
+                .get_physical_device_queue_family_properties(pd.handle())
         };
-        queue_families
-            .iter()
-            .position(|props| props.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        let gfx = props.iter()
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .map(Queue::with_index)
+            .ok_or(Error::NoGraphicsQueue)?;
+        Ok(QueueFamilies {
+            properties: props,
+            graphics: gfx,
+        })
+    }
+}
+
+impl QueueFamilies {
+    fn fill_device(&mut self, device: &ash::Device) {
+        self.graphics.fill_handle(device, 0);
+    }
+    fn present_queue(
+        &self,
+        pd: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        ext: &ash::extensions::khr::Surface
+    ) -> Result<usize, Error<'static>> {
+        if let Some(&Queue { index, .. }) = [&self.graphics].into_iter()
+            .find(|&q| q.can_present(surface, ext, pd).ok() == Some(true)) {
+            return Ok(index);
+        }
+        let it = [
+            &self.graphics
+        ].into_iter()
+            .map(|q| q.can_present(surface, ext, pd).map(|v| (q.index, v)))
+            .chain({
+                (0..self.properties.len())
+                    .map(|idx| {
+                        Queue::with_index(idx)
+                            .can_present(surface, ext, pd)
+                            .map(|v| (idx, v))
+                    })
+            });
+        for r in it {
+            let (idx, can_present) = r?;
+            if can_present {
+                return Ok(idx);
+            }
+        }
+        Err(Error::NoPresentQueue)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Queue {
+    index: usize,
+    handle: vk::Queue,
+}
+
+impl Queue {
+    #[inline(always)]
+    const fn with_index(index: usize) -> Self {
+        Queue {
+            index,
+            handle: vk::Queue::null(),
+        }
+    }
+
+    fn fill_handle(&mut self, device: &ash::Device, queue_index: u32) {
+        let info = vk::DeviceQueueInfo2::builder()
+            .flags(vk::DeviceQueueCreateFlags::empty())
+            .queue_family_index(self.index as _)
+            .queue_index(queue_index);
+        self.handle = unsafe { device.get_device_queue2(&info) };
+    }
+
+    #[inline]
+    fn can_present(&self, surface: vk::SurfaceKHR, ext: &ash::extensions::khr::Surface, pd: vk::PhysicalDevice) -> Result<bool, Error<'static>> {
+        unsafe {
+            ext.get_physical_device_surface_support(pd, self.index as _, surface)
+        }.vk("vkGetPhysicalDeviceSurfaceSupportKHR")
     }
 }
 
@@ -789,6 +994,8 @@ pub enum Error<'a> {
     /// valid `GRAPHICS` queue family
     #[error("physical device had no graphics queue family")]
     NoGraphicsQueue,
+    #[error("physical device had no presentation queue for surface")]
+    NoPresentQueue,
     /// Wrapper for [`vk::Result`], including `context` as the name of the vulkan function that
     /// triggered the wrapped error
     #[error("{context}: {result}")]
@@ -813,6 +1020,12 @@ pub enum Error<'a> {
     /// already busy
     #[error("all command buffers already busy")]
     AllCommandBuffersBusy,
+    #[error("swapchain support not found for surface")]
+    SwapchainSupport,
+    #[error("could not find compatible swapchain format")]
+    SwapchainFormat,
+    #[error("unimplemented: {0}")]
+    Unimplemented(&'a str),
 }
 
 impl<'a> Error<'a> {
