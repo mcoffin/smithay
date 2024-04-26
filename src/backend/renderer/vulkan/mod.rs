@@ -1,4 +1,4 @@
-use super::{ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl};
+use super::{ImportDma, ImportDmaWl, ImportMem, ImportMemWl};
 use crate::{
     backend::{
         allocator::{
@@ -24,6 +24,7 @@ use ash::{
 };
 use scopeguard::ScopeGuard;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     ops::{Deref, DerefMut},
@@ -38,10 +39,14 @@ use std::{
 use tracing::{debug, error, trace, warn};
 
 mod dmabuf;
+mod fence;
+mod render_pass;
 mod swapchain;
 mod util;
 use util::*;
+use fence::*;
 use swapchain::Swapchain;
+use render_pass::RenderSetup;
 
 const DEFAULT_COMMAND_BUFFERS: usize = 4;
 
@@ -59,11 +64,12 @@ pub struct VulkanRenderer {
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     command_pool: OwnedHandle<vk::CommandPool, Device>,
-    command_buffers: Box<[vk::CommandBuffer]>,
-    command_buffer_usage: Box<[AtomicBool]>,
+    // command_buffers: Box<[vk::CommandBuffer]>,
+    // command_buffer_usage: Box<[AtomicBool]>,
     target: Option<VulkanTarget>,
     upscale_filter: vk::Filter,
     downscale_filter: vk::Filter,
+    render_setups: HashMap<vk::Format, RenderSetup>,
 }
 
 impl VulkanRenderer {
@@ -140,22 +146,21 @@ impl VulkanRenderer {
                     device.create_command_pool(&pool_info, None)
                 })
                 .map(|v| OwnedHandle::from_arc(v, &device))
-        }
-        .vk("vkCreateCommandPool")?;
+        }.vk("vkCreateCommandPool")?;
 
-        let cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::builder()
-            .command_pool(*pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(DEFAULT_COMMAND_BUFFERS as _);
-        let cmd_buffers =
-            unsafe { device.allocate_command_buffers(&cmd_buf_alloc_info) }.vk("vkAllocateCommandBuffers")?;
+        // let cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::builder()
+        //     .command_pool(*pool)
+        //     .level(vk::CommandBufferLevel::PRIMARY)
+        //     .command_buffer_count(DEFAULT_COMMAND_BUFFERS as _);
+        // let cmd_buffers =
+        //     unsafe { device.allocate_command_buffers(&cmd_buf_alloc_info) }.vk("vkAllocateCommandBuffers")?;
 
-        let cmd_buffer_usage = {
-            let mut ret = Vec::with_capacity(cmd_buffers.len());
-            let usage_it = std::iter::repeat_with(|| AtomicBool::new(false));
-            ret.extend(usage_it.take(cmd_buffers.len()));
-            ret.into()
-        };
+        // let cmd_buffer_usage = {
+        //     let mut ret = Vec::with_capacity(cmd_buffers.len());
+        //     let usage_it = std::iter::repeat_with(|| AtomicBool::new(false));
+        //     ret.extend(usage_it.take(cmd_buffers.len()));
+        //     ret.into()
+        // };
 
         Ok(VulkanRenderer {
             phd: phd.clone(),
@@ -169,11 +174,12 @@ impl VulkanRenderer {
             dmabuf_cache: HashMap::new(),
             memory_props,
             command_pool: pool,
-            command_buffers: cmd_buffers.into(),
-            command_buffer_usage: cmd_buffer_usage,
+            // command_buffers: cmd_buffers.into(),
+            // command_buffer_usage: cmd_buffer_usage,
             target: None,
             upscale_filter: vk::Filter::LINEAR,
             downscale_filter: vk::Filter::LINEAR,
+            render_setups: HashMap::new(),
         })
     }
 
@@ -222,6 +228,11 @@ impl VulkanRenderer {
         &self.device
     }
 
+    #[inline(always)]
+    fn physical_device(&self) -> vk::PhysicalDevice {
+        self.phd.handle()
+    }
+
     fn format_for_drm(&self, format: &DrmFormat) -> Option<Format> {
         let &DrmFormat { code, modifier } = format;
         self.formats.get(&code).and_then(|info| {
@@ -249,36 +260,49 @@ impl VulkanRenderer {
             .find(|(_idx, ty)| (ty.property_flags & props) == props)
     }
 
-    #[inline(always)]
-    fn command_buffers(&self) -> impl Iterator<Item = (vk::CommandBuffer, &AtomicBool)> {
-        self.command_buffers
-            .iter()
-            .copied()
-            .zip(&*self.command_buffer_usage)
+    fn ensure_render_setup(
+        &mut self,
+        format: vk::Format
+    ) -> Result<(), Error<'static>> {
+        use std::collections::hash_map::Entry;
+        let device = self.device.clone();
+        if let Entry::Vacant(e) = self.render_setups.entry(format) {
+            let setup = RenderSetup::new(device, format, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR)?;
+            e.insert(setup);
+        }
+        Ok(())
     }
 
-    /// TODO: verify this AtomicBool logic and ordering w/ [`CommandBuffer::drop`]
-    fn acquire_command_buffer(&self) -> Result<CommandBuffer<'_>, Error<'static>> {
-        self.command_buffers()
-            .find(|&(_buf, in_use)| {
-                in_use
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
-                    .is_ok()
-            })
-            .map(CommandBuffer::from)
-            .ok_or(Error::AllCommandBuffersBusy)
-    }
+    // #[inline(always)]
+    // fn command_buffers(&self) -> impl Iterator<Item = (vk::CommandBuffer, &AtomicBool)> {
+    //     self.command_buffers
+    //         .iter()
+    //         .copied()
+    //         .zip(&*self.command_buffer_usage)
+    // }
+
+    // /// TODO: verify this AtomicBool logic and ordering w/ [`CommandBuffer::drop`]
+    // fn acquire_command_buffer(&self) -> Result<CommandBuffer<'_>, Error<'static>> {
+    //     self.command_buffers()
+    //         .find(|&(_buf, in_use)| {
+    //             in_use
+    //                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
+    //                 .is_ok()
+    //         })
+    //         .map(CommandBuffer::from)
+    //         .ok_or(Error::AllCommandBuffersBusy)
+    // }
 }
 
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // TODO: consider moving this into some kind of wrapper?
-        unsafe {
-            if self.command_buffers.len() > 0 && self.command_buffers.iter().any(|&buf| !buf.is_null()) {
-                self.device
-                    .free_command_buffers(*self.command_pool, &self.command_buffers);
-            }
-        }
+        // unsafe {
+        //     if self.command_buffers.len() > 0 && self.command_buffers.iter().any(|&buf| !buf.is_null()) {
+        //         self.device
+        //             .free_command_buffers(*self.command_pool, &self.command_buffers);
+        //     }
+        // }
     }
 }
 
@@ -331,14 +355,11 @@ impl Renderer for VulkanRenderer {
         _output_size: Size<i32, Physical>,
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
-        Ok(VulkanFrame {
-            renderer: self,
-            target: self.target.as_ref().ok_or(Error::NoTarget)?,
-            command_buffer: self.acquire_command_buffer()?,
-        })
+        VulkanFrame::try_from(&*self)
     }
-    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
-        todo!()
+    fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        // TODO: improve with downcast
+        sync.wait().map_err(From::from)
     }
 }
 
@@ -365,14 +386,31 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
         match &self.target {
             Some(tgt) if tgt == &*target => Ok(()),
             _ => {
-                let surface = target.handle();
-                let swapchain = Swapchain::with_surface(
-                    &*self,
+                use swapchain::SupportDetails;
+                let swapchain_support = SupportDetails::with_surface(
+                    self.phd.handle(),
                     target.handle(),
                     target.extension(),
-                    &target.extent(),
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
                 )?;
+                let vk::SurfaceFormatKHR { format, color_space } = swapchain_support.choose_format()
+                    .ok_or(Error::SwapchainFormat)?;
+
+                self.ensure_render_setup(format)?;
+                let render_setup = self.render_setups.get(&format)
+                    .ok_or(Error::RendererSetup(format))?;
+
+                let swapchain = Swapchain::with_surface(
+                    &*self,
+                    swapchain::SurfaceInfo::new(
+                        target.handle(),
+                        target.extension(),
+                        color_space,
+                        &swapchain_support
+                    ),
+                    &target.extent(),
+                    render_setup,
+                )?;
+                let surface = target.handle();
                 debug!(?swapchain, ?surface, "created swapchain");
                 self.target = Some(VulkanTarget::Surface(target, swapchain));
                 Ok(())
@@ -662,7 +700,12 @@ impl ImportMemWl for VulkanRenderer {
     }
 }
 
-impl ImportEgl for VulkanRenderer {
+#[cfg(all(
+    feature = "wayland_frontend",
+    feature = "backend_egl",
+    feature = "use_system_lib"
+))]
+impl super::ImportEgl for VulkanRenderer {
     fn bind_wl_display(&mut self, _display: &wayland_server::DisplayHandle) -> Result<(), crate::backend::egl::Error> {
         mocked!();
         Ok(())
@@ -688,6 +731,32 @@ impl ImportEgl for VulkanRenderer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MaybeOwned<T> {
+    Borrowed(T),
+    Owned(T),
+}
+
+impl<T> MaybeOwned<T> {
+    #[inline(always)]
+    fn owned(self) -> Option<T> {
+        match self {
+            MaybeOwned::Borrowed(..) => None,
+            MaybeOwned::Owned(v) => Some(v),
+        }
+    }
+}
+
+impl<T> Deref for MaybeOwned<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            MaybeOwned::Borrowed(v) => v,
+            MaybeOwned::Owned(v) => v,
+        }
+    }
+}
+
 /// [`Frame`] implementation used by a [`VulkanRenderer`]
 ///
 /// * See [`Renderer`] and [`Frame`]
@@ -695,13 +764,159 @@ impl ImportEgl for VulkanRenderer {
 pub struct VulkanFrame<'a> {
     renderer: &'a VulkanRenderer,
     target: &'a VulkanTarget,
-    command_buffer: CommandBuffer<'a>,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    image_ready: vk::Semaphore,
+    submit_ready: MaybeOwned<vk::Semaphore>,
+}
+
+impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
+    type Error = <VulkanRenderer as Renderer>::Error;
+    fn try_from(r: &'a VulkanRenderer) -> Result<Self, Self::Error> {
+        use std::mem::MaybeUninit;
+        let target = r.target.as_ref().ok_or(Error::NoTarget)?;
+        let command_buffer = unsafe {
+            let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
+            let alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .command_pool(*r.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1)
+                .build();
+            let result = (r.device().fp_v1_0().allocate_command_buffers)(
+                r.device().handle(),
+                &alloc_info as *const _,
+                ret.as_mut_ptr(),
+            );
+            match result {
+                vk::Result::SUCCESS => Ok(ret.assume_init()),
+                e => Err(Error::Vk {
+                    context: "vkAllocateCommandBuffers",
+                    result: e,
+                }),
+            }
+        }?;
+        let mut ret = VulkanFrame {
+            renderer: r,
+            target,
+            command_buffer,
+            image: vk::Image::null(),
+            image_ready: vk::Semaphore::null(),
+            submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            r.device().begin_command_buffer(ret.command_buffer, &begin_info)
+        }.vk("vkBeginCommandBuffer")?;
+
+        let (fmt, extent, framebuffer) = match &ret.target {
+            VulkanTarget::Surface(_, swapchain) => {
+                let info = vk::SemaphoreCreateInfo::builder()
+                    .flags(vk::SemaphoreCreateFlags::empty())
+                    .build();
+                ret.image_ready = unsafe {
+                    r.device().create_semaphore(&info, None)
+                }.vk("vkCreateSemaphore")?;
+                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, ret.image_ready.into())
+                    .or_else(|e| match e {
+                        swapchain::AcquireError::Suboptimal(v) => {
+                            warn!(?swapchain, "suboptimal swapchain");
+                            Ok(v)
+                        },
+                        swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
+                    })?;
+                trace!(image_idx, ?swap_image, ?ret.image_ready, "acquired image");
+                ret.image = swap_image.image;
+                ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
+                let src_layout = if swap_image.transitioned.fetch_or(true, Ordering::SeqCst) == false {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::PRESENT_SRC_KHR
+                };
+                let acquire_flags =
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::COLOR_ATTACHMENT_READ;
+                let acquire_barrier = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(acquire_flags)
+                    .old_layout(src_layout)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(swap_image.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    r.device().cmd_pipeline_barrier(
+                        ret.command_buffer,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[], &[], &[acquire_barrier.build()]
+                    );
+                }
+                (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
+            },
+        };
+        let render_setup = r.render_setups.get(&fmt).unwrap();
+
+        let begin_info = vk::RenderPassBeginInfo::builder()
+            .render_pass(render_setup.render_pass())
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            })
+            .clear_values(&[
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0f32; 4],
+                    },
+                },
+            ]);
+        let cb = ret.command_buffer;
+        unsafe {
+            r.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
+            r.device().cmd_set_viewport(cb, 0, &[
+                vk::Viewport {
+                    x: 0f32, y: 0f32,
+                    width: extent.width as _, height: extent.height as _,
+                    min_depth: 0f32, max_depth: 1f32,
+                },
+            ]);
+            r.device().cmd_set_scissor(cb, 0, &[
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }
+            ]);
+        }
+        Ok(ret)
+    }
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
     fn drop(&mut self) {
-        trace!("{}", fn_name!());
-        todo!();
+        let device = self.renderer.device();
+        unsafe {
+            match &self.submit_ready {
+                &MaybeOwned::Owned(v) if v != vk::Semaphore::null() => {
+                    device.destroy_semaphore(v, None);
+                },
+                _ => {},
+            }
+            if self.image_ready != vk::Semaphore::null() {
+                self.renderer.device().destroy_semaphore(self.image_ready, None);
+            }
+            self.renderer.device().free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
+        }
     }
 }
 
@@ -712,8 +927,60 @@ impl<'a> Frame for VulkanFrame<'a> {
     fn id(&self) -> usize {
         self.renderer.id()
     }
-    fn clear(&mut self, _color: [f32; 4], _at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        todo!()
+    fn clear(&mut self, color: [f32; 4], at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        const ZERO_RECT: vk::Rect2D = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width: 0, height: 0 },
+        };
+        const DEFAULT_CLEAR_RECT: vk::ClearRect = vk::ClearRect {
+            rect: ZERO_RECT,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        const fn clear_rect(rect: vk::Rect2D) -> vk::ClearRect {
+            vk::ClearRect {
+                rect,
+                ..DEFAULT_CLEAR_RECT
+            }
+        }
+        let cb = self.command_buffer;
+        let device = self.renderer.device();
+        let clear_color = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: color,
+            },
+        };
+        let clear_attachments = [
+            vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: clear_color,
+            },
+        ];
+        let rect_it = at.iter().map(|r| vk::Rect2D {
+            offset: vk::Offset2D { x: r.loc.x, y: r.loc.y },
+            extent: vk::Extent2D {
+                width: r.size.w as _,
+                height: r.size.h as _,
+            },
+        });
+
+        let mut clear_rects_static = [DEFAULT_CLEAR_RECT; 3];
+        let clear_rects = if at.len() <= clear_rects_static.len() {
+            rect_it.zip(&mut clear_rects_static).for_each(|(rect, out)| {
+                out.rect = rect;
+            });
+            Cow::Borrowed(&clear_rects_static[..at.len()])
+        } else {
+            let mut rects = Vec::with_capacity(at.len());
+            rects.extend(rect_it.map(clear_rect));
+            Cow::Owned(rects)
+        };
+        trace!(?clear_attachments, ?clear_rects, "clear");
+        unsafe {
+            device.cmd_clear_attachments(cb, &clear_attachments, &clear_rects);
+        }
+        Ok(())
     }
     fn draw_solid(
         &mut self,
@@ -721,7 +988,9 @@ impl<'a> Frame for VulkanFrame<'a> {
         _damage: &[Rectangle<i32, Physical>],
         _color: [f32; 4],
     ) -> Result<(), Self::Error> {
-        todo!()
+        // todo!()
+        mocked!();
+        Ok(())
     }
     fn render_texture_from_to(
         &mut self,
@@ -732,16 +1001,73 @@ impl<'a> Frame for VulkanFrame<'a> {
         _src_transform: Transform,
         _alpha: f32,
     ) -> Result<(), Self::Error> {
-        todo!()
+        // todo!()
+        mocked!();
+        Ok(())
     }
     fn transformation(&self) -> Transform {
         Transform::Normal
     }
     fn finish(self) -> Result<SyncPoint, Self::Error> {
-        todo!()
+        let submit_fence = VulkanFence::new(self.renderer.device.clone(), false)
+            .vk("vkCreateFence")?;
+        let cb = self.command_buffer;
+        let device = self.renderer.device();
+        unsafe {
+            device.cmd_end_render_pass(cb);
+            device.end_command_buffer(cb)
+        }.vk("vkEndCommandBuffer")?;
+        unsafe {
+            let acquire_stages =
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::FRAGMENT_SHADER;
+            let signal_semaphores = [*self.submit_ready];
+            let signal_semaphores: &[vk::Semaphore] = if signal_semaphores[0] == vk::Semaphore::null() {
+                &[]
+            } else {
+                &signal_semaphores[..]
+            };
+            let wait_sems = [self.image_ready];
+            let wait_stages = [acquire_stages];
+            let cmd_bufs = [self.command_buffer];
+            let info = vk::SubmitInfo::builder()
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmd_bufs)
+                .signal_semaphores(signal_semaphores);
+            device.queue_submit(
+                self.renderer.queues.graphics.handle,
+                &[info.build()],
+                submit_fence.handle(),
+            ).vk("vkQueueSubmit")?;
+            if let VulkanTarget::Surface(_, swapchain) = &self.target {
+                let wait_sems = signal_semaphores;
+                let swapchains = [swapchain.handle()];
+                let image_indices = [
+                    swapchain.images().iter().position(|swap_img| {
+                        swap_img.image == self.image
+                    }).map_or(0u32, |idx| idx as _)
+                ];
+                let mut results = [vk::Result::SUCCESS; 1];
+                let info = vk::PresentInfoKHR::builder()
+                    .wait_semaphores(wait_sems)
+                    .swapchains(&swapchains)
+                    .image_indices(&image_indices)
+                    .results(&mut results);
+                let _suboptimal = swapchain.extension().queue_present(
+                    self.renderer.queues.graphics.handle,
+                    &info
+                ).vk("vkQueuePresentKHR")?;
+                results.into_iter()
+                    .find_map(|r| std::num::NonZeroI32::new(r.as_raw()))
+                    .map_or(Ok(()), |v| Err(vk::Result::from_raw(v.get())))
+                    .vk("vkQueuePresentKHR")?;
+            }
+        }
+        Ok(SyncPoint::from(submit_fence))
     }
-    fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
-        todo!()
+    fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        sync.wait().map_err(From::from)
     }
 }
 
@@ -1026,6 +1352,10 @@ pub enum Error<'a> {
     SwapchainFormat,
     #[error("unimplemented: {0}")]
     Unimplemented(&'a str),
+    #[error("no renderer setup found for format: {0:?}")]
+    RendererSetup(vk::Format),
+    #[error("waiting for fence interrupted: {0}")]
+    Interrupted(#[from] crate::backend::renderer::sync::Interrupted),
 }
 
 impl<'a> Error<'a> {
@@ -1180,6 +1510,7 @@ impl<'a> From<(vk::CommandBuffer, &'a AtomicBool)> for CommandBuffer<'a> {
 
 contextual_handles!(Device {
     vk::CommandPool = destroy_command_pool,
+    vk::RenderPass = destroy_render_pass,
 });
 
 vulkan_handles! {
