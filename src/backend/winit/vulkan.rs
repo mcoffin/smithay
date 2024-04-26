@@ -121,7 +121,12 @@ impl WinitGraphics for WinitVulkanGraphics {
     fn submit(
         &mut self,
         _damage: Option<&mut [Rectangle<i32, Physical>]>,
-    ) -> Result<(), crate::backend::SwapBuffersError> {
+    ) -> Result<(), SwapBuffersError> {
+        let suboptimal = self.renderer.submit()
+            .map_err(|e| SwapBuffersError::ContextLost(e.into()))?;
+        if suboptimal {
+            warn!("suboptimal swapchain");
+        }
         Ok(())
     }
 }

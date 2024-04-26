@@ -6,6 +6,8 @@ pub struct Surface {
     handle: vk::SurfaceKHR,
     surface: VkSurface,
     extent: Cell<vk::Extent2D>,
+    // pub(crate) swapchain_info: Cell<SwapchainInfo>,
+    // pub(crate) submit_image: Cell<u32>,
 }
 
 impl Drop for Surface {
@@ -26,6 +28,8 @@ impl Surface {
                 width: 0,
                 height: 0,
             }),
+            // swapchain_info: Cell::new(Default::default()),
+            // submit_image: Cell::new(0),
         }
     }
 
@@ -64,3 +68,28 @@ impl fmt::Debug for Surface {
         f.debug_tuple("Surface").field(&self.handle).finish()
     }
 }
+
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub struct SwapchainInfo {
+//     pub swapchain: vk::SwapchainKHR,
+//     pub present_queue: vk::Queue,
+//     pub queue_present: Option<vk::PFN_vkQueuePresentKHR>,
+// }
+// 
+// impl SwapchainInfo {
+//     #[inline(always)]
+//     fn is_valid(&self) -> bool {
+//         self.swapchain != vk::SwapchainKHR::null()
+//             && self.present_queue != vk::Queue::null()
+//     }
+// }
+// 
+// impl Default for SwapchainInfo {
+//     fn default() -> Self {
+//         SwapchainInfo {
+//             swapchain: vk::SwapchainKHR::null(),
+//             present_queue: vk::Queue::null(),
+//             queue_present: None,
+//         }
+//     }
+// }

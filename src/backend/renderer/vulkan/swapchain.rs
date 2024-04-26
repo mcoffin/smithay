@@ -6,6 +6,7 @@ use super::{
 };
 use scopeguard::ScopeGuard;
 use std::{
+    cell::Cell,
     fmt,
     sync::{
         Arc,
@@ -25,6 +26,7 @@ pub struct Swapchain {
     present_mode: vk::PresentModeKHR,
     extent: vk::Extent2D,
     images: Box<[SwapchainImage]>,
+    pub(crate) submit_image: Cell<SubmitImage>,
 }
 
 impl Swapchain {
@@ -94,6 +96,7 @@ impl Swapchain {
             extent,
             images: ScopeGuard::into_inner(swap_images).into(),
             device,
+            submit_image: Cell::new(SubmitImage::default()),
         })
     }
 
@@ -151,6 +154,19 @@ impl Swapchain {
         } else {
             Ok(ret)
         }
+    }
+
+    pub(super) fn submit(&self, r: &VulkanRenderer) -> Result<bool, SwapchainError<&'static str>> {
+        let img = self.submit_image.get();
+        let swapchains = [self.handle()];
+        let images = [img.index];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(img.wait_semaphores())
+            .swapchains(&swapchains)
+            .image_indices(&images);
+        unsafe {
+            self.ext.queue_present(r.queues.graphics.handle, &present_info)
+        }.map_err(SwapchainError::vk("vkQueuePresentKHR"))
     }
 }
 
@@ -469,6 +485,39 @@ impl From<vk::Fence> for AcquireFeedback {
         AcquireFeedback {
             fence,
             ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitImage {
+    pub index: u32,
+    pub wait_semaphores: [vk::Semaphore; 1],
+}
+
+impl SubmitImage {
+    pub const fn new(index: u32) -> Self {
+        SubmitImage {
+            index,
+            wait_semaphores: [vk::Semaphore::null()],
+        }
+    }
+    #[inline(always)]
+    fn wait_semaphores(&self) -> &[vk::Semaphore] {
+        if self.wait_semaphores[0] != vk::Semaphore::null() {
+            &self.wait_semaphores[..]
+        } else {
+            &[]
+        }
+    }
+}
+
+impl Default for SubmitImage {
+    #[inline(always)]
+    fn default() -> Self {
+        SubmitImage {
+            index: 0,
+            wait_semaphores: [vk::Semaphore::null()],
         }
     }
 }

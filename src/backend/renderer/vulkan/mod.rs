@@ -273,6 +273,19 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    /// 1-off because [`crate::backend::vulkan::Surface`] needs to call back to this in
+    /// [`WinitGraphics::submit`].
+    ///
+    /// This only applies if `target` is a [`Surface`]
+    pub(crate) fn submit(&self) -> Result<bool, Error<'static>> {
+        match &self.target {
+            Some(VulkanTarget::Surface(_, swapchain)) => {
+                swapchain.submit(self).map_err(From::from)
+            },
+            _ => Ok(false),
+        }
+    }
+
     // #[inline(always)]
     // fn command_buffers(&self) -> impl Iterator<Item = (vk::CommandBuffer, &AtomicBool)> {
     //     self.command_buffers
@@ -370,6 +383,7 @@ impl Renderer for VulkanRenderer {
             target,
             command_buffer,
             image: vk::Image::null(),
+            image_idx: 0,
             image_ready: vk::Semaphore::null(),
             submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
             output_size,
@@ -400,6 +414,7 @@ impl Renderer for VulkanRenderer {
                     })?;
                 trace!(image_idx, ?swap_image, "acquired image");
                 ret.image = swap_image.image;
+                ret.image_idx = image_idx;
                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
                 let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
                     vk::ImageLayout::UNDEFINED
@@ -527,6 +542,11 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                 )?;
                 let surface = target.handle();
                 debug!(?swapchain, ?surface, "created swapchain");
+                // target.swapchain_info.set(crate::backend::vulkan::SwapchainInfo {
+                //     swapchain: swapchain.handle(),
+                //     present_queue: self.queues.graphics.handle,
+                //     queue_present: Some(swapchain.extension().fp().queue_present_khr),
+                // });
                 self.target = Some(VulkanTarget::Surface(target, swapchain));
                 Ok(())
             },
@@ -874,6 +894,7 @@ pub struct VulkanFrame<'a> {
     target: &'a VulkanTarget,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
+    image_idx: u32,
     image_ready: vk::Semaphore,
     submit_ready: MaybeOwned<vk::Semaphore>,
     output_size: Size<i32, Physical>,
@@ -1116,6 +1137,7 @@ impl<'a> Frame for VulkanFrame<'a> {
         Transform::Normal
     }
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
+        use swapchain::SubmitImage;
         let mut submit_fence = VulkanFence::new(self.renderer.device.clone(), false)
             .vk("vkCreateFence")?;
 
@@ -1129,47 +1151,47 @@ impl<'a> Frame for VulkanFrame<'a> {
             let acquire_stages =
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                 | vk::PipelineStageFlags::FRAGMENT_SHADER;
-            let signal_semaphores = [*self.submit_ready];
-            let signal_semaphores: &[vk::Semaphore] = if signal_semaphores[0] == vk::Semaphore::null() {
-                &[]
-            } else {
-                &signal_semaphores[..]
-            };
+            // let signal_semaphores = [*self.submit_ready];
+            // let signal_semaphores: &[vk::Semaphore] = if signal_semaphores[0] == vk::Semaphore::null() {
+            //     &[]
+            // } else {
+            //     &signal_semaphores[..]
+            // };
             let wait_sems = [self.image_ready];
             let wait_stages = [acquire_stages];
             let cmd_bufs = [self.command_buffer];
             let info = vk::SubmitInfo::builder()
                 .wait_semaphores(&wait_sems)
                 .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&cmd_bufs)
-                .signal_semaphores(signal_semaphores);
+                .command_buffers(&cmd_bufs);
             device.queue_submit(
                 self.renderer.queues.graphics.handle,
                 &[info.build()],
                 submit_fence.handle(),
             ).vk("vkQueueSubmit")?;
-            if let VulkanTarget::Surface(_, swapchain) = &self.target {
-                let wait_sems = signal_semaphores;
-                let swapchains = [swapchain.handle()];
-                let image_indices = [
-                    swapchain.images().iter().position(|swap_img| {
-                        swap_img.image == self.image
-                    }).map_or(0u32, |idx| idx as _)
-                ];
-                let mut results = [vk::Result::SUCCESS; 1];
-                let info = vk::PresentInfoKHR::builder()
-                    .wait_semaphores(wait_sems)
-                    .swapchains(&swapchains)
-                    .image_indices(&image_indices)
-                    .results(&mut results);
-                let _suboptimal = swapchain.extension().queue_present(
-                    self.renderer.queues.graphics.handle,
-                    &info
-                ).vk("vkQueuePresentKHR")?;
-                results.into_iter()
-                    .find_map(|r| std::num::NonZeroI32::new(r.as_raw()))
-                    .map_or(Ok(()), |v| Err(vk::Result::from_raw(v.get())))
-                    .vk("vkQueuePresentKHR")?;
+            if let VulkanTarget::Surface(surface, swapchain) = self.target {
+                swapchain.submit_image.set(SubmitImage::new(self.image_idx));
+                // let wait_sems = signal_semaphores;
+                // let swapchains = [swapchain.handle()];
+                // let image_indices = [
+                //     swapchain.images().iter().position(|swap_img| {
+                //         swap_img.image == self.image
+                //     }).map_or(0u32, |idx| idx as _)
+                // ];
+                // let mut results = [vk::Result::SUCCESS; 1];
+                // let info = vk::PresentInfoKHR::builder()
+                //     .wait_semaphores(wait_sems)
+                //     .swapchains(&swapchains)
+                //     .image_indices(&image_indices)
+                //     .results(&mut results);
+                // let _suboptimal = swapchain.extension().queue_present(
+                //     self.renderer.queues.graphics.handle,
+                //     &info
+                // ).vk("vkQueuePresentKHR")?;
+                // results.into_iter()
+                //     .find_map(|r| std::num::NonZeroI32::new(r.as_raw()))
+                //     .map_or(Ok(()), |v| Err(vk::Result::from_raw(v.get())))
+                //     .vk("vkQueuePresentKHR")?;
             }
         }
 

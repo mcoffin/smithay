@@ -55,7 +55,7 @@ impl VulkanFence {
 impl Drop for VulkanFence {
     fn drop(&mut self) {
         match self.status() {
-            Ok(FenceStatus::Signaled) => if let Err(error) = unsafe {
+            Ok(FenceStatus::Unsignaled) => if let Err(error) = unsafe {
                 self.device.wait_for_fences(&[self.handle], true, u64::MAX)
             } {
                 error!(?error, "error waiting on fence in destructor");
