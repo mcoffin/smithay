@@ -35,9 +35,11 @@ use std::{
         Arc, Weak,
     },
 };
+
 #[allow(unused_imports)]
 use tracing::{debug, error, trace, warn};
 
+mod command_pool;
 mod dmabuf;
 mod fence;
 mod render_pass;
