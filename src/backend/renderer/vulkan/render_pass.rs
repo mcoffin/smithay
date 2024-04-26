@@ -96,7 +96,7 @@ impl RenderSetup {
 
     #[inline]
     pub fn swapchain_usage_flags(&self) -> vk::ImageUsageFlags {
-        self.usage_flags & vk::ImageUsageFlags::COLOR_ATTACHMENT
+        self.usage_flags | usage_flags_always()
     }
 }
 
@@ -106,4 +106,10 @@ impl Drop for RenderSetup {
             self.device.destroy_render_pass(self.handle, None);
         }
     }
+}
+
+#[inline(always)]
+fn usage_flags_always() -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::COLOR_ATTACHMENT
+    | vk::ImageUsageFlags::TRANSFER_DST
 }

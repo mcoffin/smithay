@@ -338,10 +338,137 @@ impl Renderer for VulkanRenderer {
     }
     fn render(
         &mut self,
-        _output_size: Size<i32, Physical>,
+        output_size: Size<i32, Physical>,
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
-        VulkanFrame::try_from(&*self)
+        use std::mem::MaybeUninit;
+        let target = self.target.as_ref().ok_or(Error::NoTarget)?;
+        let command_buffer = unsafe {
+            let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
+            let alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .command_pool(*self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1)
+                .build();
+            let result = (self.device().fp_v1_0().allocate_command_buffers)(
+                self.device().handle(),
+                &alloc_info as *const _,
+                ret.as_mut_ptr(),
+            );
+            match result {
+                vk::Result::SUCCESS => Ok(ret.assume_init()),
+                e => Err(Error::Vk {
+                    context: "vkAllocateCommandBuffers",
+                    result: e,
+                }),
+            }
+        }?;
+        let mut ret = VulkanFrame {
+            renderer: self,
+            target,
+            command_buffer,
+            image: vk::Image::null(),
+            image_ready: vk::Semaphore::null(),
+            submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
+            output_size,
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.device().begin_command_buffer(ret.command_buffer, &begin_info)
+        }.vk("vkBeginCommandBuffer")?;
+
+        let (fmt, extent, framebuffer) = match &ret.target {
+            VulkanTarget::Surface(_, swapchain) => {
+                // TODO: fixme fuck
+                ret.image_ready = unsafe {
+                    let info = vk::SemaphoreCreateInfo::builder()
+                        .flags(vk::SemaphoreCreateFlags::empty())
+                        .build();
+                    self.device().create_semaphore(&info, None)
+                }.vk("vkCreateSemaphore")?;
+                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
+                    .or_else(|e| match e {
+                        swapchain::AcquireError::Suboptimal(v) => {
+                            warn!(?swapchain, "suboptimal swapchain");
+                            Ok(v)
+                        },
+                        swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
+                    })?;
+                trace!(image_idx, ?swap_image, "acquired image");
+                ret.image = swap_image.image;
+                ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
+                let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::PRESENT_SRC_KHR
+                };
+                let acquire_flags =
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::COLOR_ATTACHMENT_READ;
+                let acquire_barrier = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(acquire_flags)
+                    .old_layout(src_layout)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(swap_image.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device().cmd_pipeline_barrier(
+                        ret.command_buffer,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[], &[], &[acquire_barrier.build()]
+                    );
+                }
+                (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
+            },
+        };
+        let render_setup = self.render_setups.get(&fmt).unwrap();
+
+        let begin_info = vk::RenderPassBeginInfo::builder()
+            .render_pass(render_setup.render_pass())
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            })
+            .clear_values(&[
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0f32; 4],
+                    },
+                },
+            ]);
+        let cb = ret.command_buffer;
+        unsafe {
+            self.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
+            self.device().cmd_set_viewport(cb, 0, &[
+                vk::Viewport {
+                    x: 0f32, y: 0f32,
+                    width: extent.width as _, height: extent.height as _,
+                    min_depth: 0f32, max_depth: 1f32,
+                },
+            ]);
+            self.device().cmd_set_scissor(cb, 0, &[
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }
+            ]);
+        }
+        Ok(ret)
     }
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         self.device.wait_fence_vk(sync)
@@ -747,140 +874,141 @@ pub struct VulkanFrame<'a> {
     image: vk::Image,
     image_ready: vk::Semaphore,
     submit_ready: MaybeOwned<vk::Semaphore>,
+    output_size: Size<i32, Physical>,
 }
 
-impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
-    type Error = <VulkanRenderer as Renderer>::Error;
-    fn try_from(r: &'a VulkanRenderer) -> Result<Self, Self::Error> {
-        use std::mem::MaybeUninit;
-        let target = r.target.as_ref().ok_or(Error::NoTarget)?;
-        let command_buffer = unsafe {
-            let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
-            let alloc_info = vk::CommandBufferAllocateInfo::builder()
-                .command_pool(*r.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1)
-                .build();
-            let result = (r.device().fp_v1_0().allocate_command_buffers)(
-                r.device().handle(),
-                &alloc_info as *const _,
-                ret.as_mut_ptr(),
-            );
-            match result {
-                vk::Result::SUCCESS => Ok(ret.assume_init()),
-                e => Err(Error::Vk {
-                    context: "vkAllocateCommandBuffers",
-                    result: e,
-                }),
-            }
-        }?;
-        let mut ret = VulkanFrame {
-            renderer: r,
-            target,
-            command_buffer,
-            image: vk::Image::null(),
-            image_ready: vk::Semaphore::null(),
-            submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
-        };
-
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            r.device().begin_command_buffer(ret.command_buffer, &begin_info)
-        }.vk("vkBeginCommandBuffer")?;
-
-        let (fmt, extent, framebuffer) = match &ret.target {
-            VulkanTarget::Surface(_, swapchain) => {
-                // TODO: fixme fuck
-                ret.image_ready = unsafe {
-                    let info = vk::SemaphoreCreateInfo::builder()
-                        .flags(vk::SemaphoreCreateFlags::empty())
-                        .build();
-                    r.device().create_semaphore(&info, None)
-                }.vk("vkCreateSemaphore")?;
-                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
-                    .or_else(|e| match e {
-                        swapchain::AcquireError::Suboptimal(v) => {
-                            warn!(?swapchain, "suboptimal swapchain");
-                            Ok(v)
-                        },
-                        swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
-                    })?;
-                trace!(image_idx, ?swap_image, "acquired image");
-                ret.image = swap_image.image;
-                ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
-                let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    vk::ImageLayout::PRESENT_SRC_KHR
-                };
-                let acquire_flags =
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                    | vk::AccessFlags::COLOR_ATTACHMENT_READ;
-                let acquire_barrier = vk::ImageMemoryBarrier::builder()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(acquire_flags)
-                    .old_layout(src_layout)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(swap_image.image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
-                unsafe {
-                    r.device().cmd_pipeline_barrier(
-                        ret.command_buffer,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[], &[], &[acquire_barrier.build()]
-                    );
-                }
-                (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
-            },
-        };
-        let render_setup = r.render_setups.get(&fmt).unwrap();
-
-        let begin_info = vk::RenderPassBeginInfo::builder()
-            .render_pass(render_setup.render_pass())
-            .framebuffer(framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            })
-            .clear_values(&[
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0f32; 4],
-                    },
-                },
-            ]);
-        let cb = ret.command_buffer;
-        unsafe {
-            r.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
-            r.device().cmd_set_viewport(cb, 0, &[
-                vk::Viewport {
-                    x: 0f32, y: 0f32,
-                    width: extent.width as _, height: extent.height as _,
-                    min_depth: 0f32, max_depth: 1f32,
-                },
-            ]);
-            r.device().cmd_set_scissor(cb, 0, &[
-                vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                }
-            ]);
-        }
-        Ok(ret)
-    }
-}
+// impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
+//     type Error = <VulkanRenderer as Renderer>::Error;
+//     fn try_from(r: &'a VulkanRenderer) -> Result<Self, Self::Error> {
+//         use std::mem::MaybeUninit;
+//         let target = r.target.as_ref().ok_or(Error::NoTarget)?;
+//         let command_buffer = unsafe {
+//             let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
+//             let alloc_info = vk::CommandBufferAllocateInfo::builder()
+//                 .command_pool(*r.command_pool)
+//                 .level(vk::CommandBufferLevel::PRIMARY)
+//                 .command_buffer_count(1)
+//                 .build();
+//             let result = (r.device().fp_v1_0().allocate_command_buffers)(
+//                 r.device().handle(),
+//                 &alloc_info as *const _,
+//                 ret.as_mut_ptr(),
+//             );
+//             match result {
+//                 vk::Result::SUCCESS => Ok(ret.assume_init()),
+//                 e => Err(Error::Vk {
+//                     context: "vkAllocateCommandBuffers",
+//                     result: e,
+//                 }),
+//             }
+//         }?;
+//         let mut ret = VulkanFrame {
+//             renderer: r,
+//             target,
+//             command_buffer,
+//             image: vk::Image::null(),
+//             image_ready: vk::Semaphore::null(),
+//             submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
+//         };
+// 
+//         let begin_info = vk::CommandBufferBeginInfo::builder()
+//             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+//         unsafe {
+//             r.device().begin_command_buffer(ret.command_buffer, &begin_info)
+//         }.vk("vkBeginCommandBuffer")?;
+// 
+//         let (fmt, extent, framebuffer) = match &ret.target {
+//             VulkanTarget::Surface(_, swapchain) => {
+//                 // TODO: fixme fuck
+//                 ret.image_ready = unsafe {
+//                     let info = vk::SemaphoreCreateInfo::builder()
+//                         .flags(vk::SemaphoreCreateFlags::empty())
+//                         .build();
+//                     r.device().create_semaphore(&info, None)
+//                 }.vk("vkCreateSemaphore")?;
+//                 let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
+//                     .or_else(|e| match e {
+//                         swapchain::AcquireError::Suboptimal(v) => {
+//                             warn!(?swapchain, "suboptimal swapchain");
+//                             Ok(v)
+//                         },
+//                         swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
+//                     })?;
+//                 trace!(image_idx, ?swap_image, "acquired image");
+//                 ret.image = swap_image.image;
+//                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
+//                 let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
+//                     vk::ImageLayout::UNDEFINED
+//                 } else {
+//                     vk::ImageLayout::PRESENT_SRC_KHR
+//                 };
+//                 let acquire_flags =
+//                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+//                     | vk::AccessFlags::COLOR_ATTACHMENT_READ;
+//                 let acquire_barrier = vk::ImageMemoryBarrier::builder()
+//                     .src_access_mask(vk::AccessFlags::empty())
+//                     .dst_access_mask(acquire_flags)
+//                     .old_layout(src_layout)
+//                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+//                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+//                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+//                     .image(swap_image.image)
+//                     .subresource_range(vk::ImageSubresourceRange {
+//                         aspect_mask: vk::ImageAspectFlags::COLOR,
+//                         base_mip_level: 0,
+//                         level_count: 1,
+//                         base_array_layer: 0,
+//                         layer_count: 1,
+//                     });
+//                 unsafe {
+//                     r.device().cmd_pipeline_barrier(
+//                         ret.command_buffer,
+//                         vk::PipelineStageFlags::TOP_OF_PIPE,
+//                         vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+//                         | vk::PipelineStageFlags::FRAGMENT_SHADER,
+//                         vk::DependencyFlags::empty(),
+//                         &[], &[], &[acquire_barrier.build()]
+//                     );
+//                 }
+//                 (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
+//             },
+//         };
+//         let render_setup = r.render_setups.get(&fmt).unwrap();
+// 
+//         let begin_info = vk::RenderPassBeginInfo::builder()
+//             .render_pass(render_setup.render_pass())
+//             .framebuffer(framebuffer)
+//             .render_area(vk::Rect2D {
+//                 offset: vk::Offset2D { x: 0, y: 0 },
+//                 extent,
+//             })
+//             .clear_values(&[
+//                 vk::ClearValue {
+//                     color: vk::ClearColorValue {
+//                         float32: [0f32; 4],
+//                     },
+//                 },
+//             ]);
+//         let cb = ret.command_buffer;
+//         unsafe {
+//             r.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
+//             r.device().cmd_set_viewport(cb, 0, &[
+//                 vk::Viewport {
+//                     x: 0f32, y: 0f32,
+//                     width: extent.width as _, height: extent.height as _,
+//                     min_depth: 0f32, max_depth: 1f32,
+//                 },
+//             ]);
+//             r.device().cmd_set_scissor(cb, 0, &[
+//                 vk::Rect2D {
+//                     offset: vk::Offset2D { x: 0, y: 0 },
+//                     extent,
+//                 }
+//             ]);
+//         }
+//         Ok(ret)
+//     }
+// }
 
 impl<'a> Drop for VulkanFrame<'a> {
     fn drop(&mut self) {
@@ -907,12 +1035,11 @@ impl<'a> Frame for VulkanFrame<'a> {
         self.renderer.id()
     }
     fn clear(&mut self, color: [f32; 4], at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        const ZERO_RECT: vk::Rect2D = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width: 0, height: 0 },
-        };
         const DEFAULT_CLEAR_RECT: vk::ClearRect = vk::ClearRect {
-            rect: ZERO_RECT,
+            rect: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width: 0, height: 0 },
+            },
             base_array_layer: 0,
             layer_count: 1,
         };
@@ -955,7 +1082,6 @@ impl<'a> Frame for VulkanFrame<'a> {
             rects.extend(rect_it.map(clear_rect));
             Cow::Owned(rects)
         };
-        trace!(?clear_attachments, ?clear_rects, "clear");
         unsafe {
             device.cmd_clear_attachments(cb, &clear_attachments, &clear_rects);
         }
