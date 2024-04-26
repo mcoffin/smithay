@@ -48,8 +48,6 @@ use fence::*;
 use swapchain::Swapchain;
 use render_pass::RenderSetup;
 
-const DEFAULT_COMMAND_BUFFERS: usize = 4;
-
 /// [`Renderer`] implementation using the [`vulkan`](https://www.vulkan.org/) graphics API
 #[derive(Debug)]
 pub struct VulkanRenderer {
@@ -294,18 +292,6 @@ impl VulkanRenderer {
     // }
 }
 
-impl Drop for VulkanRenderer {
-    fn drop(&mut self) {
-        // TODO: consider moving this into some kind of wrapper?
-        // unsafe {
-        //     if self.command_buffers.len() > 0 && self.command_buffers.iter().any(|&buf| !buf.is_null()) {
-        //         self.device
-        //             .free_command_buffers(*self.command_pool, &self.command_buffers);
-        //     }
-        // }
-    }
-}
-
 macro_rules! vk_call {
     ($e:expr, $fname:expr) => {
         unsafe { $e }.vk($fname)
@@ -358,8 +344,7 @@ impl Renderer for VulkanRenderer {
         VulkanFrame::try_from(&*self)
     }
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        // TODO: improve with downcast
-        sync.wait().map_err(From::from)
+        self.device.wait_fence_vk(sync)
     }
 }
 
@@ -731,24 +716,17 @@ impl super::ImportEgl for VulkanRenderer {
     }
 }
 
+/// Simple wrapper for keeping track of whether or not a given raw vulkan handle is owned or just a
+/// borrowed [`Copy`] variant
 #[derive(Debug, Clone, Copy)]
 enum MaybeOwned<T> {
     Borrowed(T),
     Owned(T),
 }
 
-impl<T> MaybeOwned<T> {
-    #[inline(always)]
-    fn owned(self) -> Option<T> {
-        match self {
-            MaybeOwned::Borrowed(..) => None,
-            MaybeOwned::Owned(v) => Some(v),
-        }
-    }
-}
-
 impl<T> Deref for MaybeOwned<T> {
     type Target = T;
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         match self {
             MaybeOwned::Borrowed(v) => v,
@@ -812,13 +790,14 @@ impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
 
         let (fmt, extent, framebuffer) = match &ret.target {
             VulkanTarget::Surface(_, swapchain) => {
-                let info = vk::SemaphoreCreateInfo::builder()
-                    .flags(vk::SemaphoreCreateFlags::empty())
-                    .build();
+                // TODO: fixme fuck
                 ret.image_ready = unsafe {
+                    let info = vk::SemaphoreCreateInfo::builder()
+                        .flags(vk::SemaphoreCreateFlags::empty())
+                        .build();
                     r.device().create_semaphore(&info, None)
                 }.vk("vkCreateSemaphore")?;
-                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, ret.image_ready.into())
+                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
                     .or_else(|e| match e {
                         swapchain::AcquireError::Suboptimal(v) => {
                             warn!(?swapchain, "suboptimal swapchain");
@@ -826,10 +805,10 @@ impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
                         },
                         swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
                     })?;
-                trace!(image_idx, ?swap_image, ?ret.image_ready, "acquired image");
+                trace!(image_idx, ?swap_image, "acquired image");
                 ret.image = swap_image.image;
                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
-                let src_layout = if swap_image.transitioned.fetch_or(true, Ordering::SeqCst) == false {
+                let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
                     vk::ImageLayout::UNDEFINED
                 } else {
                     vk::ImageLayout::PRESENT_SRC_KHR
@@ -912,10 +891,9 @@ impl<'a> Drop for VulkanFrame<'a> {
                 },
                 _ => {},
             }
-            if self.image_ready != vk::Semaphore::null() {
-                self.renderer.device().destroy_semaphore(self.image_ready, None);
+            if self.command_buffer != vk::CommandBuffer::null() {
+                self.renderer.device().free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
             }
-            self.renderer.device().free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
         }
     }
 }
@@ -1008,9 +986,10 @@ impl<'a> Frame for VulkanFrame<'a> {
     fn transformation(&self) -> Transform {
         Transform::Normal
     }
-    fn finish(self) -> Result<SyncPoint, Self::Error> {
-        let submit_fence = VulkanFence::new(self.renderer.device.clone(), false)
+    fn finish(mut self) -> Result<SyncPoint, Self::Error> {
+        let mut submit_fence = VulkanFence::new(self.renderer.device.clone(), false)
             .vk("vkCreateFence")?;
+
         let cb = self.command_buffer;
         let device = self.renderer.device();
         unsafe {
@@ -1064,10 +1043,20 @@ impl<'a> Frame for VulkanFrame<'a> {
                     .vk("vkQueuePresentKHR")?;
             }
         }
+
+        // give release-ownership of handles that need to outlive rendering ops to the fence
+        //
+        // NOTE: if the caller releases the resulting SyncPoint *before* the work is done, that
+        // ain't good (for now)
+        submit_fence.image_ready = self.image_ready;
+        submit_fence.cb = CommandBuffer::new(self.command_buffer, *self.renderer.command_pool);
+        self.image_ready = vk::Semaphore::null();
+        self.command_buffer = vk::CommandBuffer::null();
+
         Ok(SyncPoint::from(submit_fence))
     }
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        sync.wait().map_err(From::from)
+        self.renderer.device.wait_fence_vk(sync)
     }
 }
 
@@ -1424,11 +1413,6 @@ trait DeviceExt {
             self.memory_requirements(image)
         }
     }
-    unsafe fn allocate_command_buffers_array(
-        &self,
-        info: &mut vk::CommandBufferAllocateInfo,
-        buffers: &mut [vk::CommandBuffer],
-    ) -> Result<(), vk::Result>;
 }
 impl DeviceExt for ash::Device {
     fn memory_requirements(&self, image: vk::Image) -> vk::MemoryRequirements2 {
@@ -1453,58 +1437,6 @@ impl DeviceExt for ash::Device {
             self.get_image_memory_requirements2(&info, &mut ret);
         }
         ret
-    }
-    unsafe fn allocate_command_buffers_array(
-        &self,
-        info: &mut vk::CommandBufferAllocateInfo,
-        buffers: &mut [vk::CommandBuffer],
-    ) -> Result<(), vk::Result> {
-        let create = self.fp_v1_0().allocate_command_buffers;
-        info.command_buffer_count = buffers.len() as _;
-        let ret = create(self.handle(), info, buffers.as_mut_ptr());
-        if ret == vk::Result::SUCCESS {
-            Ok(())
-        } else {
-            Err(ret)
-        }
-    }
-}
-
-/// Borrowed [`vk::CommandBuffer`] from a [`VulkanRenderer`]
-///
-/// Will set it's `in_use` flag back to `false` in the [`Drop`] implementation
-#[derive(Debug)]
-struct CommandBuffer<'a> {
-    handle: vk::CommandBuffer,
-    in_use: &'a AtomicBool,
-}
-
-impl<'a> Drop for CommandBuffer<'a> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        trace!("{}", fn_name!());
-        // in release mode, just store the value as `false`, assuming that the previous value was
-        // `true`
-        #[cfg(not(debug_assertions))]
-        self.in_use.store(false, Ordering::Relaxed);
-
-        // in debug mode, use `compare_exchange` to ensure the value was previously `true`
-        #[cfg(debug_assertions)]
-        {
-            assert_eq!(
-                self.in_use
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire),
-                Ok(true)
-            )
-        }
-    }
-}
-
-impl<'a> From<(vk::CommandBuffer, &'a AtomicBool)> for CommandBuffer<'a> {
-    #[inline(always)]
-    fn from(v: (vk::CommandBuffer, &'a AtomicBool)) -> Self {
-        let (handle, in_use) = v;
-        CommandBuffer { handle, in_use }
     }
 }
 

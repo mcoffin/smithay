@@ -270,6 +270,7 @@ pub struct SwapchainImage {
     pub image: vk::Image,
     pub image_view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
+    pub image_ready_semaphore: vk::Semaphore,
     pub submit_semaphore: vk::Semaphore,
     pub transitioned: AtomicBool,
 }
@@ -324,17 +325,26 @@ impl SwapchainImage {
             .map(|v| scopeguard::guard(v, |v| unsafe {
                 device.destroy_framebuffer(v, None);
             }))?;
-        let sem_info = vk::SemaphoreCreateInfo::builder()
-            .flags(vk::SemaphoreCreateFlags::empty())
-            .build();
-        let semaphore = unsafe {
-            device.create_semaphore(&sem_info, None)
-        }.map_err(SwapchainError::vk("vkCreateSemaphore"))?;
+        let create_semaphore = || {
+            let sem_info = vk::SemaphoreCreateInfo::builder()
+                .flags(vk::SemaphoreCreateFlags::empty())
+                .build();
+            unsafe {
+                device.create_semaphore(&sem_info, None)
+            }
+                .map_err(SwapchainError::vk("vkCreateSemaphore"))
+                .map(|v| scopeguard::guard(v, |v| unsafe {
+                    device.destroy_semaphore(v, None);
+                }))
+        };
+        let image_ready_sem = create_semaphore()?;
+        let submit_sem = create_semaphore()?;
         Ok(SwapchainImage {
             image,
             image_view: ScopeGuard::into_inner(image_view),
             framebuffer: ScopeGuard::into_inner(framebuffer),
-            submit_semaphore: semaphore,
+            image_ready_semaphore: ScopeGuard::into_inner(image_ready_sem),
+            submit_semaphore: ScopeGuard::into_inner(submit_sem),
             transitioned: AtomicBool::new(false),
         })
     }
@@ -342,7 +352,13 @@ impl SwapchainImage {
     unsafe fn destroy(&self, device: &ash::Device) {
         device.destroy_framebuffer(self.framebuffer, None);
         device.destroy_image_view(self.image_view, None);
-        device.destroy_semaphore(self.submit_semaphore, None);
+        let semaphores = [
+            self.image_ready_semaphore,
+            self.submit_semaphore,
+        ];
+        for sem in semaphores {
+            device.destroy_semaphore(sem, None);
+        }
     }
 }
 
