@@ -384,6 +384,7 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                 let render_setup = self.render_setups.get(&format)
                     .ok_or(Error::RendererSetup(format))?;
 
+                self.target = None;
                 let swapchain = Swapchain::with_surface(
                     &*self,
                     swapchain::SurfaceInfo::new(

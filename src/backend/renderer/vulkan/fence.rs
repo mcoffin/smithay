@@ -54,17 +54,17 @@ impl VulkanFence {
 
 impl Drop for VulkanFence {
     fn drop(&mut self) {
-        let status = match self.status() {
-            Ok(FenceStatus::Signaled) => if let Err(e) = unsafe {
+        match self.status() {
+            Ok(FenceStatus::Signaled) => if let Err(error) = unsafe {
                 self.device.wait_for_fences(&[self.handle], true, u64::MAX)
             } {
-                error!("error waiting on fence in destructor");
+                error!(?error, "error waiting on fence in destructor");
             },
-            Err(e) => {
-                error!("error getting fence status: {:?}", &e);
+            Err(error) => {
+                error!(?error, "error getting fence status");
             },
             _ => {},
-        };
+        }
         unsafe {
             if self.cb.is_valid() {
                 self.device.free_command_buffers(self.cb.pool, &self.cb.buffers);
@@ -80,8 +80,8 @@ impl Drop for VulkanFence {
 impl Fence for VulkanFence {
     fn is_signaled(&self) -> bool {
         let ret = self.status();
-        if let &Err(ref e) = &ret {
-            error!("{}: {:?}", fn_name!(), e);
+        if let Err(error) = &ret {
+            error!(?error, "{}", fn_name!());
         }
         match self.status() {
             Ok(FenceStatus::Signaled) => true,
@@ -176,7 +176,7 @@ impl Default for CommandBuffer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FenceStatus {
+pub enum FenceStatus {
     Signaled,
     Unsignaled,
 }

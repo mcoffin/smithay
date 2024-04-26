@@ -116,11 +116,13 @@ impl WinitGraphics for WinitVulkanGraphics {
         &self.surface
     }
 
+    /// This is a no-op on winit+vulkan as the submission is handled in [`Frame::finish`]
+    #[inline(always)]
     fn submit(
         &mut self,
         _damage: Option<&mut [Rectangle<i32, Physical>]>,
     ) -> Result<(), crate::backend::SwapBuffersError> {
-        todo!()
+        Ok(())
     }
 }
 
