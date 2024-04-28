@@ -16,11 +16,12 @@ vec2 verts[4] = vec2[](
 );
 
 void main() {
-	// vec2 pos = vec2(
-	// 	float((gl_VertexIndex + 1) & 2) * 0.5f,
-	// 	float(gl_VertexIndex & 2) * 0.5f
-	// );
-	vec2 pos = verts[gl_VertexIndex % 4];
+	// vec2 pos = verts[gl_VertexIndex % 4];
+	vec2 pos = vec2(
+		float((gl_VertexIndex + 1) & 2) * 0.5f,
+		float(gl_VertexIndex & 2) * 0.5f
+	);
 	tex_pos = (pos * data.tex_extent) + data.tex_offset;
+
 	gl_Position = data.transform * vec4(pos, 0.0, 1.0);
 }

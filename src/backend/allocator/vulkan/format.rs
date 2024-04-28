@@ -90,3 +90,10 @@ pub(crate) fn known_vk_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
         .iter()
         .filter_map(|&f| get_vk_format(f).map(move |vk| (f, vk)))
 }
+
+pub const MEM_FORMATS: &[(Fourcc, vk::Format)] = &[
+    (Fourcc::Argb8888, vk::Format::B8G8R8A8_SRGB),
+    (Fourcc::Xrgb8888, vk::Format::B8G8R8A8_SRGB),
+    (Fourcc::Abgr8888, vk::Format::R8G8B8A8_SRGB),
+    (Fourcc::Xbgr8888, vk::Format::R8G8B8A8_SRGB),
+];

@@ -213,6 +213,7 @@ fn vk_compile_shaders() -> Result<(), Box<dyn std::error::Error>> {
     compile_shaders! {
         "common.vert",
         "quad.frag",
+        "texture.frag",
     }
     Ok(())
 }

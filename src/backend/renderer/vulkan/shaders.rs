@@ -36,6 +36,7 @@ shader_sources! {
     }
     (frag, ShaderSourcesFrag) {
         quad,
+        texture,
     }
 }
 
