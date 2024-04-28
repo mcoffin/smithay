@@ -124,6 +124,99 @@ fn test_gbm_bo_create_with_modifiers2() {
     }
 }
 
+#[cfg(feature = "renderer_vulkan")]
+fn vk_compile_shaders() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{
+        env,
+        io,
+        process::{
+            Command,
+            ExitStatus,
+        },
+        path::{
+            Path,
+            PathBuf,
+        },
+        ffi::OsString,
+    };
+    #[derive(Debug, thiserror::Error)]
+    #[error("missing required environment variable: {0}")]
+    struct MissingEnv<'a>(&'a str);
+
+    #[inline]
+    fn required_env(key: &str) -> Result<OsString, MissingEnv<'_>> {
+        env::var_os(key).ok_or(MissingEnv(key))
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum CommandError {
+        #[error("error running command: {0}")]
+        Io(#[from] io::Error),
+        #[error("command exited with failure status: {0:?}")]
+        Exit(ExitStatus),
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("error running {command}: {error}")]
+    struct NamedCommandError<'a> {
+        command: &'a str,
+        error: CommandError,
+    }
+
+    impl CommandError {
+        #[inline(always)]
+        fn named(self, name: &str) -> NamedCommandError<'_> {
+            NamedCommandError {
+                command: name,
+                error: self,
+            }
+        }
+    }
+
+    trait CommandExt {
+        fn status_checked(&mut self) -> Result<(), CommandError>;
+    }
+    impl CommandExt for Command {
+        fn status_checked(&mut self) -> Result<(), CommandError> {
+            self.status()
+                .map_err(CommandError::from)
+                .and_then(|status| if status.success() {
+                    Ok(())
+                } else {
+                    Err(CommandError::Exit(status))
+                })
+        }
+    }
+
+    let out_dir = required_env("OUT_DIR")
+        .map(PathBuf::from)?;
+    let compile_shader = |in_path: &str, out_name: &str| -> Result<(), NamedCommandError<'static>> {
+        const GLSLC: &str = "glslc";
+        let out_path = out_dir.join(out_name);
+        println!("cargo:rerun-if-changed={}", in_path);
+        Command::new(GLSLC)
+            .args(["--target-env=vulkan1.1", in_path, "-o"])
+            .arg(out_path)
+            .status_checked()
+            .map_err(|e| e.named(GLSLC))
+    };
+    macro_rules! compile_shaders {
+        ($($name:expr),+ $(,)?) => {
+            $(
+                compile_shader(
+                    concat!("src/backend/renderer/vulkan/shaders/", $name),
+                    concat!($name, ".spv"),
+                )?;
+            )+
+        };
+    }
+    compile_shaders! {
+        "common.vert",
+        "quad.frag",
+    }
+    Ok(())
+}
+
 fn main() {
     #[cfg(any(feature = "backend_egl", feature = "renderer_gl"))]
     gl_generate();
@@ -135,4 +228,7 @@ fn main() {
         not(feature = "backend_gbm_has_create_with_modifiers2")
     ))]
     test_gbm_bo_create_with_modifiers2();
+
+    #[cfg(feature = "renderer_vulkan")]
+    vk_compile_shaders().expect("failed to compile vulkan shaders");
 }

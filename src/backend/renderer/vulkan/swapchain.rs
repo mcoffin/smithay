@@ -3,6 +3,7 @@ use super::{
     VulkanRenderer,
     Error,
     ErrorExt,
+    Queue,
 };
 use scopeguard::ScopeGuard;
 use std::{
@@ -25,6 +26,9 @@ pub struct Swapchain {
     present_mode: vk::PresentModeKHR,
     extent: vk::Extent2D,
     images: Box<[SwapchainImage]>,
+    init_queue: Queue,
+    pool: vk::CommandPool,
+    init_buffers: Box<[vk::CommandBuffer]>,
 }
 
 impl Swapchain {
@@ -79,9 +83,42 @@ impl Swapchain {
                 swap_img.destroy(&device);
             }
         });
-        for img in images.into_iter() {
-            let swap_image = SwapchainImage::new(r.device(), img, format, render_setup.render_pass(), &extent)?;
+        for (idx, img) in images.into_iter().enumerate() {
+            let swap_image = SwapchainImage::new(r.device(), img, idx, format, render_setup.render_pass(), &extent)?;
             swap_images.push(swap_image);
+        }
+        let pool_info = vk::CommandPoolCreateInfo {
+            s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: vk::CommandPoolCreateFlags::empty(),
+            queue_family_index: r.queues.graphics.index as _,
+        };
+        let pool = unsafe {
+            device.create_command_pool(&pool_info, None)
+        }
+            .vk("vkCreateCommandPool")
+            .map(|v| scopeguard::guard(v, |v| unsafe {
+                device.destroy_command_pool(v, None);
+            }))?;
+        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(*pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(swap_images.len() as _);
+        let init_buffers = unsafe {
+            device.allocate_command_buffers(&alloc_info)
+        }
+            .map(Into::<Box<[vk::CommandBuffer]>>::into)
+            .vk("vkAllocateCommandBuffers")
+            .map(|v| scopeguard::guard(v, |v| unsafe {
+                device.free_command_buffers(*pool, &v);
+            }))?;
+        for (&SwapchainImage { image, .. }, &cb) in swap_images.iter().zip(&**init_buffers) {
+            record_clear(
+                &device, cb, image,
+                (vk::AccessFlags::empty(), vk::ImageLayout::PRESENT_SRC_KHR),
+                [0f32, 0f32, 0f32, 1.0],
+                r.queues.graphics.index as _,
+            )?;
         }
         Ok(Swapchain {
             handle: ScopeGuard::into_inner(handle),
@@ -93,6 +130,9 @@ impl Swapchain {
             present_mode: surface_info.present_mode,
             extent,
             images: ScopeGuard::into_inner(swap_images).into(),
+            init_queue: r.queues.graphics,
+            init_buffers: ScopeGuard::into_inner(init_buffers),
+            pool: ScopeGuard::into_inner(pool),
             device,
         })
     }
@@ -134,9 +174,9 @@ impl Swapchain {
     pub(super) fn acquire(
         &self,
         timeout: u64,
-        feedback: AcquireFeedback,
+        feedback: &mut AcquireFeedback,
     ) -> Result<(u32, &SwapchainImage), AcquireError<'_>> {
-        let AcquireFeedback { semaphore, fence } = feedback;
+        let &mut AcquireFeedback { semaphore, fence } = feedback;
         let (idx, suboptimal) = unsafe {
             self.ext.acquire_next_image(
                 self.handle,
@@ -145,6 +185,32 @@ impl Swapchain {
                 fence,
             )
         }.map_err(SwapchainError::vk("vkAcquireNextImageKHR"))?;
+        let img = &self.images()[idx as usize];
+        if !img.transitioned.fetch_or(true, Ordering::SeqCst) {
+            let signal_semaphore = unsafe {
+                let info = vk::SemaphoreCreateInfo::builder()
+                    .build();
+                self.device.create_semaphore(&info, None)
+            }
+                .map(|v| [v])
+                .map_err(SwapchainError::vk("vkCreateSemaphore"))
+                .map(|v| scopeguard::guard(v, |v| unsafe {
+                    self.device.destroy_semaphore(v[0], None)
+                }))?;
+            let cbs = [self.init_buffers[idx as usize]];
+            let wait = [semaphore];
+            const WAIT_STAGES: &[vk::PipelineStageFlags] = &[vk::PipelineStageFlags::TRANSFER];
+            let submit_info = vk::SubmitInfo::builder()
+                .wait_semaphores(&wait)
+                .wait_dst_stage_mask(WAIT_STAGES)
+                .command_buffers(&cbs)
+                .signal_semaphores(&*signal_semaphore);
+            unsafe {
+                self.device.queue_submit(self.init_queue.handle, &[submit_info.build()], vk::Fence::null())
+                    .map_err(SwapchainError::vk("vkQueueSubmit"))?;
+            }
+            feedback.semaphore = ScopeGuard::into_inner(signal_semaphore)[0];
+        }
         let ret = (idx, &self.images()[idx as usize]);
         if suboptimal {
             Err(AcquireError::Suboptimal(ret))
@@ -173,8 +239,92 @@ impl Drop for Swapchain {
                 swap_image.destroy(&self.device);
             }
             self.ext.destroy_swapchain(self.handle, None);
+            self.device.free_command_buffers(self.pool, &self.init_buffers);
+            self.device.destroy_command_pool(self.pool, None);
         }
     }
+}
+
+fn record_clear(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    dst_layout: (vk::AccessFlags, vk::ImageLayout),
+    color: [f32; 4],
+    queue_idx: u32,
+) -> Result<(), SwapchainError<&'static str>> {
+    trait CommandBufferExt {
+        fn begin(&self, device: &ash::Device) -> Result<(), SwapchainError<&'static str>>;
+        fn end(&self, device: &ash::Device) -> Result<(), SwapchainError<&'static str>>;
+    }
+    impl CommandBufferExt for vk::CommandBuffer {
+        #[inline]
+        fn begin(&self, device: &ash::Device) -> Result<(), SwapchainError<&'static str>> {
+            let info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::empty())
+                .build();
+            unsafe {
+                device.begin_command_buffer(*self, &info)
+            }.map_err(SwapchainError::vk("vkBeginCommandBuffer"))
+        }
+        #[inline]
+        fn end(&self, device: &ash::Device) -> Result<(), SwapchainError<&'static str>> {
+            unsafe {
+                device.end_command_buffer(*self)
+            }.map_err(SwapchainError::vk("vkEndCommandBuffer"))
+        }
+    }
+    cb.begin(device)?;
+    const SUBRESOURCE_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let mut barrier = vk::ImageMemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(queue_idx)
+        .dst_queue_family_index(queue_idx)
+        .image(image)
+        .subresource_range(SUBRESOURCE_RANGE)
+        .build();
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[barrier]
+        );
+        device.cmd_clear_color_image(
+            cb,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue {
+                float32: color,
+            },
+            &[SUBRESOURCE_RANGE]
+        );
+    }
+    let (dst_access, dst_layout) = dst_layout;
+    barrier.old_layout = barrier.new_layout;
+    barrier.new_layout = dst_layout;
+    barrier.src_access_mask = barrier.dst_access_mask;
+    barrier.dst_access_mask = dst_access;
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[barrier]
+        );
+    }
+    cb.end(device)
 }
 
 #[derive(Debug)]
@@ -272,6 +422,7 @@ pub struct SwapchainImage {
     pub framebuffer: vk::Framebuffer,
     pub image_ready_semaphore: vk::Semaphore,
     pub submit_semaphore: vk::Semaphore,
+    pub index: usize,
     pub transitioned: AtomicBool,
 }
 
@@ -279,6 +430,7 @@ impl SwapchainImage {
     fn new(
         device: &ash::Device,
         image: vk::Image,
+        index: usize,
         format: vk::Format,
         render_pass: vk::RenderPass,
         extent: &vk::Extent2D,
@@ -346,6 +498,7 @@ impl SwapchainImage {
             image_ready_semaphore: ScopeGuard::into_inner(image_ready_sem),
             submit_semaphore: ScopeGuard::into_inner(submit_sem),
             transitioned: AtomicBool::new(false),
+            index,
         })
     }
     #[inline]

@@ -12,7 +12,7 @@ use super::{
 pub struct VulkanFence {
     device: Arc<super::Device>,
     handle: vk::Fence,
-    pub(super) image_ready: vk::Semaphore,
+    pub(super) image_ready: [vk::Semaphore; 2],
     pub(super) cb: CommandBuffer,
 }
 
@@ -32,7 +32,7 @@ impl VulkanFence {
         Ok(VulkanFence {
             device,
             handle,
-            image_ready: vk::Semaphore::null(),
+            image_ready: [vk::Semaphore::null(); 2],
             cb: Default::default(),
         })
     }
@@ -69,9 +69,12 @@ impl Drop for VulkanFence {
             if self.cb.is_valid() {
                 self.device.free_command_buffers(self.cb.pool, &self.cb.buffers);
             }
-            if self.image_ready != vk::Semaphore::null() {
-                self.device.destroy_semaphore(self.image_ready, None);
-            }
+            self.image_ready.iter()
+                .copied()
+                .filter(|&v| v != vk::Semaphore::null())
+                .for_each(|sem| unsafe {
+                    self.device.destroy_semaphore(sem, None);
+                });
             self.device.destroy_fence(self.handle, None);
         }
     }

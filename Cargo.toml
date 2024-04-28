@@ -11,6 +11,7 @@ homepage = "https://smithay.github.io/"
 keywords = ["wayland", "compositor", "graphics", "server"]
 categories = ["gui"]
 rust-version = "1.72.0"
+build = "build.rs"
 
 [package.metadata.docs.rs]
 features = ["test_all_features"]
@@ -80,6 +81,7 @@ tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 gl_generator = { version = "0.14", optional = true }
 pkg-config = { version = "0.3.17", optional = true }
 cc = { version = "1.0.79", optional = true }
+thiserror = "1.0"
 
 [features]
 default = ["backend_drm", "backend_gbm", "backend_libinput", "backend_udev", "backend_session_libseat", "backend_x11", "backend_winit", "desktop", "renderer_gl", "renderer_pixman", "renderer_multi", "xwayland", "wayland_frontend", "backend_vulkan", "renderer_vulkan"]

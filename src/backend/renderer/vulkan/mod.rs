@@ -43,6 +43,7 @@ mod command_pool;
 mod dmabuf;
 mod fence;
 mod render_pass;
+mod shaders;
 mod swapchain;
 mod util;
 use util::*;
@@ -64,8 +65,6 @@ pub struct VulkanRenderer {
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     command_pool: OwnedHandle<vk::CommandPool, Device>,
-    // command_buffers: Box<[vk::CommandBuffer]>,
-    // command_buffer_usage: Box<[AtomicBool]>,
     target: Option<VulkanTarget>,
     upscale_filter: vk::Filter,
     downscale_filter: vk::Filter,
@@ -148,20 +147,6 @@ impl VulkanRenderer {
                 .map(|v| OwnedHandle::from_arc(v, &device))
         }.vk("vkCreateCommandPool")?;
 
-        // let cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::builder()
-        //     .command_pool(*pool)
-        //     .level(vk::CommandBufferLevel::PRIMARY)
-        //     .command_buffer_count(DEFAULT_COMMAND_BUFFERS as _);
-        // let cmd_buffers =
-        //     unsafe { device.allocate_command_buffers(&cmd_buf_alloc_info) }.vk("vkAllocateCommandBuffers")?;
-
-        // let cmd_buffer_usage = {
-        //     let mut ret = Vec::with_capacity(cmd_buffers.len());
-        //     let usage_it = std::iter::repeat_with(|| AtomicBool::new(false));
-        //     ret.extend(usage_it.take(cmd_buffers.len()));
-        //     ret.into()
-        // };
-
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
@@ -174,8 +159,6 @@ impl VulkanRenderer {
             dmabuf_cache: HashMap::new(),
             memory_props,
             command_pool: pool,
-            // command_buffers: cmd_buffers.into(),
-            // command_buffer_usage: cmd_buffer_usage,
             target: None,
             upscale_filter: vk::Filter::LINEAR,
             downscale_filter: vk::Filter::LINEAR,
@@ -272,26 +255,6 @@ impl VulkanRenderer {
         }
         Ok(())
     }
-
-    // #[inline(always)]
-    // fn command_buffers(&self) -> impl Iterator<Item = (vk::CommandBuffer, &AtomicBool)> {
-    //     self.command_buffers
-    //         .iter()
-    //         .copied()
-    //         .zip(&*self.command_buffer_usage)
-    // }
-
-    // /// TODO: verify this AtomicBool logic and ordering w/ [`CommandBuffer::drop`]
-    // fn acquire_command_buffer(&self) -> Result<CommandBuffer<'_>, Error<'static>> {
-    //     self.command_buffers()
-    //         .find(|&(_buf, in_use)| {
-    //             in_use
-    //                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
-    //                 .is_ok()
-    //         })
-    //         .map(CommandBuffer::from)
-    //         .ok_or(Error::AllCommandBuffersBusy)
-    // }
 }
 
 macro_rules! vk_call {
@@ -370,7 +333,7 @@ impl Renderer for VulkanRenderer {
             target,
             command_buffer,
             image: vk::Image::null(),
-            image_ready: vk::Semaphore::null(),
+            image_ready: [vk::Semaphore::null(); 2],
             submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
             output_size,
         };
@@ -384,13 +347,14 @@ impl Renderer for VulkanRenderer {
         let (fmt, extent, framebuffer) = match &ret.target {
             VulkanTarget::Surface(_, swapchain) => {
                 // TODO: fixme fuck
-                ret.image_ready = unsafe {
+                ret.image_ready[0] = unsafe {
                     let info = vk::SemaphoreCreateInfo::builder()
                         .flags(vk::SemaphoreCreateFlags::empty())
                         .build();
                     self.device().create_semaphore(&info, None)
                 }.vk("vkCreateSemaphore")?;
-                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
+                let mut feedback = swapchain::AcquireFeedback::from(ret.image_ready[0]);
+                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, &mut feedback)
                     .or_else(|e| match e {
                         swapchain::AcquireError::Suboptimal(v) => {
                             warn!(?swapchain, "suboptimal swapchain");
@@ -398,21 +362,22 @@ impl Renderer for VulkanRenderer {
                         },
                         swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
                     })?;
+                if feedback.semaphore != ret.image_ready[0] {
+                    ret.image_ready = [
+                        feedback.semaphore,
+                        ret.image_ready[0],
+                    ];
+                }
                 trace!(image_idx, ?swap_image, "acquired image");
                 ret.image = swap_image.image;
                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
-                let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    vk::ImageLayout::PRESENT_SRC_KHR
-                };
-                let acquire_flags =
+                let acquire_access =
                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::COLOR_ATTACHMENT_READ;
                 let acquire_barrier = vk::ImageMemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(acquire_flags)
-                    .old_layout(src_layout)
+                    .dst_access_mask(acquire_access)
+                    .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -874,143 +839,10 @@ pub struct VulkanFrame<'a> {
     target: &'a VulkanTarget,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
-    image_ready: vk::Semaphore,
+    image_ready: [vk::Semaphore; 2],
     submit_ready: MaybeOwned<vk::Semaphore>,
     output_size: Size<i32, Physical>,
 }
-
-// impl<'a> TryFrom<&'a VulkanRenderer> for VulkanFrame<'a> {
-//     type Error = <VulkanRenderer as Renderer>::Error;
-//     fn try_from(r: &'a VulkanRenderer) -> Result<Self, Self::Error> {
-//         use std::mem::MaybeUninit;
-//         let target = r.target.as_ref().ok_or(Error::NoTarget)?;
-//         let command_buffer = unsafe {
-//             let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
-//             let alloc_info = vk::CommandBufferAllocateInfo::builder()
-//                 .command_pool(*r.command_pool)
-//                 .level(vk::CommandBufferLevel::PRIMARY)
-//                 .command_buffer_count(1)
-//                 .build();
-//             let result = (r.device().fp_v1_0().allocate_command_buffers)(
-//                 r.device().handle(),
-//                 &alloc_info as *const _,
-//                 ret.as_mut_ptr(),
-//             );
-//             match result {
-//                 vk::Result::SUCCESS => Ok(ret.assume_init()),
-//                 e => Err(Error::Vk {
-//                     context: "vkAllocateCommandBuffers",
-//                     result: e,
-//                 }),
-//             }
-//         }?;
-//         let mut ret = VulkanFrame {
-//             renderer: r,
-//             target,
-//             command_buffer,
-//             image: vk::Image::null(),
-//             image_ready: vk::Semaphore::null(),
-//             submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
-//         };
-// 
-//         let begin_info = vk::CommandBufferBeginInfo::builder()
-//             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-//         unsafe {
-//             r.device().begin_command_buffer(ret.command_buffer, &begin_info)
-//         }.vk("vkBeginCommandBuffer")?;
-// 
-//         let (fmt, extent, framebuffer) = match &ret.target {
-//             VulkanTarget::Surface(_, swapchain) => {
-//                 // TODO: fixme fuck
-//                 ret.image_ready = unsafe {
-//                     let info = vk::SemaphoreCreateInfo::builder()
-//                         .flags(vk::SemaphoreCreateFlags::empty())
-//                         .build();
-//                     r.device().create_semaphore(&info, None)
-//                 }.vk("vkCreateSemaphore")?;
-//                 let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready))
-//                     .or_else(|e| match e {
-//                         swapchain::AcquireError::Suboptimal(v) => {
-//                             warn!(?swapchain, "suboptimal swapchain");
-//                             Ok(v)
-//                         },
-//                         swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
-//                     })?;
-//                 trace!(image_idx, ?swap_image, "acquired image");
-//                 ret.image = swap_image.image;
-//                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
-//                 let src_layout = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
-//                     vk::ImageLayout::UNDEFINED
-//                 } else {
-//                     vk::ImageLayout::PRESENT_SRC_KHR
-//                 };
-//                 let acquire_flags =
-//                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-//                     | vk::AccessFlags::COLOR_ATTACHMENT_READ;
-//                 let acquire_barrier = vk::ImageMemoryBarrier::builder()
-//                     .src_access_mask(vk::AccessFlags::empty())
-//                     .dst_access_mask(acquire_flags)
-//                     .old_layout(src_layout)
-//                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-//                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-//                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-//                     .image(swap_image.image)
-//                     .subresource_range(vk::ImageSubresourceRange {
-//                         aspect_mask: vk::ImageAspectFlags::COLOR,
-//                         base_mip_level: 0,
-//                         level_count: 1,
-//                         base_array_layer: 0,
-//                         layer_count: 1,
-//                     });
-//                 unsafe {
-//                     r.device().cmd_pipeline_barrier(
-//                         ret.command_buffer,
-//                         vk::PipelineStageFlags::TOP_OF_PIPE,
-//                         vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-//                         | vk::PipelineStageFlags::FRAGMENT_SHADER,
-//                         vk::DependencyFlags::empty(),
-//                         &[], &[], &[acquire_barrier.build()]
-//                     );
-//                 }
-//                 (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
-//             },
-//         };
-//         let render_setup = r.render_setups.get(&fmt).unwrap();
-// 
-//         let begin_info = vk::RenderPassBeginInfo::builder()
-//             .render_pass(render_setup.render_pass())
-//             .framebuffer(framebuffer)
-//             .render_area(vk::Rect2D {
-//                 offset: vk::Offset2D { x: 0, y: 0 },
-//                 extent,
-//             })
-//             .clear_values(&[
-//                 vk::ClearValue {
-//                     color: vk::ClearColorValue {
-//                         float32: [0f32; 4],
-//                     },
-//                 },
-//             ]);
-//         let cb = ret.command_buffer;
-//         unsafe {
-//             r.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
-//             r.device().cmd_set_viewport(cb, 0, &[
-//                 vk::Viewport {
-//                     x: 0f32, y: 0f32,
-//                     width: extent.width as _, height: extent.height as _,
-//                     min_depth: 0f32, max_depth: 1f32,
-//                 },
-//             ]);
-//             r.device().cmd_set_scissor(cb, 0, &[
-//                 vk::Rect2D {
-//                     offset: vk::Offset2D { x: 0, y: 0 },
-//                     extent,
-//                 }
-//             ]);
-//         }
-//         Ok(ret)
-//     }
-// }
 
 impl<'a> Drop for VulkanFrame<'a> {
     fn drop(&mut self) {
@@ -1022,6 +854,12 @@ impl<'a> Drop for VulkanFrame<'a> {
                 },
                 _ => {},
             }
+            self.image_ready.iter()
+                .copied()
+                .filter(|&v| v != vk::Semaphore::null())
+                .for_each(|semaphore| {
+                    device.destroy_semaphore(semaphore, None);
+                });
             if self.command_buffer != vk::CommandBuffer::null() {
                 self.renderer.device().free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
             }
@@ -1135,11 +973,10 @@ impl<'a> Frame for VulkanFrame<'a> {
             } else {
                 &signal_semaphores[..]
             };
-            let wait_sems = [self.image_ready];
             let wait_stages = [acquire_stages];
             let cmd_bufs = [self.command_buffer];
             let info = vk::SubmitInfo::builder()
-                .wait_semaphores(&wait_sems)
+                .wait_semaphores(&self.image_ready[..1])
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmd_bufs)
                 .signal_semaphores(signal_semaphores);
@@ -1179,7 +1016,7 @@ impl<'a> Frame for VulkanFrame<'a> {
         // ain't good (for now)
         submit_fence.image_ready = self.image_ready;
         submit_fence.cb = CommandBuffer::new(self.command_buffer, *self.renderer.command_pool);
-        self.image_ready = vk::Semaphore::null();
+        self.image_ready = [vk::Semaphore::null(); 2];
         self.command_buffer = vk::CommandBuffer::null();
 
         Ok(SyncPoint::from(submit_fence))
