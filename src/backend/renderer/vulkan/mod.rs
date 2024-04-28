@@ -31,6 +31,10 @@ use cgmath::{
 use scopeguard::ScopeGuard;
 use std::{
     borrow::Cow,
+    cell::{
+        Cell,
+        RefCell,
+    },
     collections::HashMap,
     fmt,
     mem,
@@ -53,6 +57,7 @@ mod memory;
 mod render_pass;
 mod shaders;
 mod swapchain;
+mod transform;
 mod util;
 use util::*;
 use fence::*;
@@ -64,6 +69,7 @@ use render_pass::{
     UniformDataFrag,
 };
 use memory::DeviceExtMemory;
+use transform::TransformExt;
 
 type Mat3 = Matrix3<f32>;
 
@@ -271,6 +277,11 @@ impl VulkanRenderer {
         }
         Ok(())
     }
+
+    fn cleanup(&mut self) -> Result<(), Error<'static>> {
+        self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
+        Ok(())
+    }
 }
 
 macro_rules! vk_call {
@@ -323,6 +334,7 @@ impl Renderer for VulkanRenderer {
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
         use std::mem::MaybeUninit;
+        self.cleanup()?;
         let target = self.target.as_ref().ok_or(Error::NoTarget)?;
         let command_buffer = unsafe {
             let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
@@ -355,6 +367,7 @@ impl Renderer for VulkanRenderer {
             setup,
             command_buffer,
             image: vk::Image::null(),
+            image_idx: 0,
             image_ready: [vk::Semaphore::null(); 2],
             submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
             output_size,
@@ -366,6 +379,44 @@ impl Renderer for VulkanRenderer {
         unsafe {
             self.device().begin_command_buffer(ret.command_buffer, &begin_info)
         }.vk("vkBeginCommandBuffer")?;
+
+        let mut dmabuf_it = self.dmabuf_cache.iter()
+            .filter_map(|(_, image)| if image.0.layout.get() != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                Some(image)
+            } else {
+                None
+            })
+            .peekable();
+        if dmabuf_it.peek().is_some() {
+            let barriers = dmabuf_it.map(|image| {
+                image.0.layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image.0.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .build()
+            }).collect::<Vec<_>>();
+            unsafe {
+                self.device().cmd_pipeline_barrier(
+                    ret.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], barriers.as_slice()
+                );
+            }
+        }
 
         let (fmt, extent, framebuffer) = match &ret.target {
             VulkanTarget::Surface(_, swapchain) => {
@@ -402,6 +453,7 @@ impl Renderer for VulkanRenderer {
                     vk::PipelineStageFlags::TOP_OF_PIPE)
                 };
                 ret.image = swap_image.image;
+                ret.image_idx = image_idx;
                 ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
                 let acquire_access =
                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
@@ -750,14 +802,17 @@ impl ImportDma for VulkanRenderer {
             "vkBindImageMemory2"
         )?;
 
-        let image = VulkanImage::new(InnerImage {
+        let mut image = InnerImage {
             image: ScopeGuard::into_inner(image),
             memories: ScopeGuard::into_inner(memories),
             buffer: vk::Buffer::null(),
             dimensions: (width, height),
             format: fmt,
+            views: RefCell::new(Vec::new()),
+            layout: Cell::new(vk::ImageLayout::UNDEFINED),
             device: Arc::downgrade(&self.device),
-        });
+        };
+        let image = VulkanImage::new(image);
         self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
         Ok(image)
     }
@@ -780,6 +835,10 @@ fn mem_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
         vk_fmt,
         vk::Format::B8G8R8A8_SRGB
         | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::B8G8R8_SRGB
+        | vk::Format::R8G8B8_SRGB
     ))
 }
 
@@ -1018,6 +1077,8 @@ impl ImportMem for VulkanRenderer {
                 drm: format,
                 modifier: None,
             },
+            views: RefCell::new(Vec::new()),
+            layout: Cell::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             device: Arc::downgrade(&self.device),
         };
         ret.memories[0] = ScopeGuard::into_inner(image_mem);
@@ -1110,6 +1171,7 @@ pub struct VulkanFrame<'a> {
     setup: &'a RenderSetup,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
+    image_idx: u32,
     image_ready: [vk::Semaphore; 2],
     submit_ready: MaybeOwned<vk::Semaphore>,
     output_size: Size<i32, Physical>,
@@ -1140,6 +1202,10 @@ impl<'a> Drop for VulkanFrame<'a> {
 }
 
 impl<'a> VulkanFrame<'a> {
+    #[inline(always)]
+    fn frame_id(&self) -> usize {
+        self.image_idx as _
+    }
     fn bind_pipeline(&mut self, pipeline: vk::Pipeline, layout: vk::PipelineLayout) {
         if pipeline != self.bound_pipeline.0 {
             unsafe {
@@ -1152,26 +1218,24 @@ impl<'a> VulkanFrame<'a> {
             self.bound_pipeline = (pipeline, layout);
         }
     }
-    fn push_constants(&self, data: &UniformData) {
+    unsafe fn push_constants(&self, data: &UniformData) {
         use mem::offset_of;
         let device = self.renderer.device();
-        unsafe {
-            device.push_constant(
-                self.command_buffer,
-                self.bound_pipeline.1,
-                vk::ShaderStageFlags::VERTEX,
-                0, &data.vert
-            );
-            const FRAG_OFFSET: usize = offset_of!(UniformData, frag);
-            debug_assert_eq!(FRAG_OFFSET, 80);
-            device.push_constant(
-                self.command_buffer,
-                self.bound_pipeline.1,
-                vk::ShaderStageFlags::FRAGMENT,
-                FRAG_OFFSET as _,
-                &data.frag
-            );
-        }
+        device.push_constant(
+            self.command_buffer,
+            self.bound_pipeline.1,
+            vk::ShaderStageFlags::VERTEX,
+            0, &data.vert
+        );
+        const FRAG_OFFSET: usize = offset_of!(UniformData, frag);
+        debug_assert_eq!(FRAG_OFFSET, 80);
+        device.push_constant(
+            self.command_buffer,
+            self.bound_pipeline.1,
+            vk::ShaderStageFlags::FRAGMENT,
+            FRAG_OFFSET as _,
+            &data.frag
+        );
     }
     #[inline(always)]
     fn reset_viewport(&self) {
@@ -1187,6 +1251,19 @@ impl<'a> VulkanFrame<'a> {
                 }]
             );
         }
+    }
+
+    unsafe fn rect_viewport<Coords>(&self, dst: &Rectangle<i32, Coords>) {
+        self.renderer.device().cmd_set_viewport(
+            self.command_buffer, 0, &[vk::Viewport {
+                x: dst.loc.x as _,
+                y: dst.loc.y as _,
+                width: dst.size.w as _,
+                height: dst.size.h as _,
+                min_depth: 0f32,
+                max_depth: 1f32,
+            }]
+        );
     }
 }
 
@@ -1266,42 +1343,70 @@ impl<'a> Frame for VulkanFrame<'a> {
         color: [f32; 4],
     ) -> Result<(), Self::Error> {
         let (pipe, layout) = self.setup.quad_pipeline();
-        self.bind_pipeline(pipe, layout);
-        self.push_constants(&UniformData {
-            vert: UniformDataVert {
-                transform: Matrix4::one(),
-                tex_offset: Vector2::new(0f32, 0f32),
-                tex_extent: Vector2::new(1f32, 1f32),
-            },
-            frag: UniformDataFrag {
-                color,
-            },
-        });
-        let device = self.renderer.device();
+        self.bind_pipeline(pipe, layout.layout);
         unsafe {
-            device.cmd_set_viewport(
-                self.command_buffer, 0, &[vk::Viewport {
-                    x: dst.loc.x as _,
-                    y: dst.loc.y as _,
-                    width: dst.size.w as _,
-                    height: dst.size.h as _,
-                    min_depth: 0f32,
-                    max_depth: 1f32,
-                }]
-            );
-            device.cmd_draw(self.command_buffer, 4, 2, 0, 0);
+            self.push_constants(&UniformData {
+                vert: UniformDataVert {
+                    transform: Matrix4::one(),
+                    tex_offset: Vector2::new(0f32, 0f32),
+                    tex_extent: Vector2::new(1f32, 1f32),
+                },
+                frag: UniformDataFrag {
+                    color,
+                },
+            });
+            self.rect_viewport(&dst);
+            self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
         }
         Ok(())
     }
     fn render_texture_from_to(
         &mut self,
-        _texture: &Self::TextureId,
-        _src: Rectangle<f64, BufferCoord>,
-        _dst: Rectangle<i32, Physical>,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
-        _src_transform: Transform,
-        _alpha: f32,
+        src_transform: Transform,
+        alpha: f32,
     ) -> Result<(), Self::Error> {
+        let device = self.renderer.device();
+        let (pipe, layout) = self.setup.tex_pipeline();
+        {
+            let view = texture.0.get_or_create_view(layout)?;
+            self.bind_pipeline(pipe, layout.layout);
+            unsafe {
+                let idx = self.frame_id();
+                device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout.layout,
+                    0,
+                    &view.descriptor_sets[idx..(idx+1)],
+                    &[]
+                );
+            }
+        }
+        let (tw, th) = (texture.width(), texture.height());
+        unsafe {
+            self.push_constants(&UniformData {
+                vert: UniformDataVert {
+                    transform: src_transform.to_matrix(),
+                    tex_offset: Vector2::new(
+                        (src.loc.x / (tw as f64)) as f32,
+                        (src.loc.y / (th as f64)) as f32,
+                    ),
+                    tex_extent: Vector2::new(
+                        (src.size.w / (tw as f64)) as f32,
+                        (src.size.h / (th as f64)) as f32,
+                    ),
+                },
+                frag: UniformDataFrag {
+                    alpha,
+                },
+            });
+            self.rect_viewport(&dst);
+            self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
+        }
         // todo!()
         mocked!();
         Ok(())
@@ -1414,12 +1519,113 @@ impl Texture for VulkanImage {
 }
 
 #[derive(Debug)]
+struct InnerImageView {
+    image_view: vk::ImageView,
+    ds_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
+impl InnerImageView {
+    fn new(image: &InnerImage, layout: &render_pass::PipelineLayout, max: u32) -> Result<Self, Error<'static>> {
+        let device = image.device.upgrade().unwrap();
+        let info = vk::ImageViewCreateInfo::builder()
+            .image(image.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(image.format.vk)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: if image.has_alpha() {
+                    vk::ComponentSwizzle::IDENTITY
+                } else {
+                    vk::ComponentSwizzle::ONE
+                },
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let mut ret = unsafe {
+            device.create_image_view(&info, None)
+                .vk("vkCreateImageView")
+        }.map(|image_view| InnerImageView {
+            image_view,
+            ds_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
+        }).map(|v| scopeguard::guard(v, |mut v| unsafe {
+            v.destroy(&device);
+        }))?;
+
+        let pool_sizes = &[
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: max,
+            },
+        ];
+        let info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(max)
+            .pool_sizes(pool_sizes);
+        ret.ds_pool = unsafe {
+            device.create_descriptor_pool(&info, None)
+        }.vk("vkCreateDescriptorPool")?;
+
+        let ds_layouts = vec![layout.ds_layout; max as usize];
+        let info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(ret.ds_pool)
+            .set_layouts(ds_layouts.as_slice());
+        ret.descriptor_sets = unsafe {
+            device.allocate_descriptor_sets(&info)
+        }.vk("vkAllocateDescriptorSets")?;
+        debug_assert_eq!(ret.descriptor_sets.len(), max as usize);
+
+        let image_info = [
+            vk::DescriptorImageInfo {
+                sampler: layout.sampler,
+                image_view: ret.image_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+        ];
+        let mut writes = Vec::with_capacity(ret.descriptor_sets.len());
+        let it = ret.descriptor_sets.iter()
+            .map(|&ds| {
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(ds)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info)
+                    .build()
+            });
+        writes.extend(it);
+        unsafe {
+            device.update_descriptor_sets(writes.as_slice(), &[]);
+        }
+
+        Ok(ScopeGuard::into_inner(ret))
+    }
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.image_view != vk::ImageView::null() {
+            device.destroy_image_view(self.image_view, None);
+        }
+        if self.ds_pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(self.ds_pool, None);
+        }
+    }
+}
+
+#[derive(Debug)]
 struct InnerImage {
     image: vk::Image,
     memories: [vk::DeviceMemory; MAX_PLANES],
     buffer: vk::Buffer,
     dimensions: (u32, u32),
     format: Format,
+    views: RefCell<Vec<(vk::DescriptorSetLayout, InnerImageView)>>,
+    layout: Cell<vk::ImageLayout>,
     device: Weak<Device>,
 }
 
@@ -1428,6 +1634,47 @@ impl InnerImage {
     fn memories(&self) -> impl Iterator<Item=&'_ vk::DeviceMemory> {
         self.memories.iter()
             .filter(|&&mem| mem != vk::DeviceMemory::null())
+    }
+
+    #[inline]
+    fn has_alpha(&self) -> bool {
+        trait VkFormatExt {
+            fn has_alpha(self) -> bool;
+        }
+        impl VkFormatExt for vk::Format {
+            fn has_alpha(self) -> bool {
+                !matches!(
+                    self,
+                    vk::Format::B8G8R8_SRGB
+                    | vk::Format::R8G8B8_SRGB
+                )
+            }
+        }
+        self.format.vk.has_alpha()
+    }
+
+    fn get_or_create_view(&self, layout: &render_pass::PipelineLayout) -> Result<impl Deref<Target=InnerImageView> + '_, Error<'static>> {
+        use std::cell::Ref;
+        debug_assert_ne!(layout.ds_layout, vk::DescriptorSetLayout::null());
+        {
+            let views = self.views.borrow();
+            let get_view = |key: vk::DescriptorSetLayout| Ref::filter_map(views, |views| {
+                views.iter().find_map(|&(layout, ref view)| if layout == key {
+                    Some(view)
+                } else {
+                    None
+                })
+            });
+            if let Ok(v) = get_view(layout.ds_layout) {
+                return Ok(v);
+            }
+        }
+        {
+            let mut views = self.views.borrow_mut();
+            let view = InnerImageView::new(self, layout, 4)?;
+            views.push((layout.ds_layout, view));
+        }
+        Ok(Ref::map(self.views.borrow(), |views| &views[views.len()-1].1))
     }
 }
 
@@ -1438,6 +1685,10 @@ impl Drop for InnerImage {
             return;
         };
         unsafe {
+            let mut views = self.views.borrow_mut();
+            for (_, view) in &mut *views {
+                view.destroy(&device);
+            }
             device.destroy_image(self.image, None);
             if self.buffer != vk::Buffer::null() {
                 device.destroy_buffer(self.buffer, None);

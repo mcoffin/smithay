@@ -61,11 +61,14 @@ macro_rules! vk_format_table {
 //
 // Many of these conversions come from wsi_common_wayland.c in Mesa
 vk_format_table! {
-    Argb8888 => B8G8R8A8_SRGB,
+    Argb8888 => B8G8R8A8_UNORM,
     Xrgb8888 => B8G8R8A8_SRGB,
 
-    Abgr8888 => R8G8B8A8_SRGB,
+    Abgr8888 => R8G8B8A8_UNORM,
     Xbgr8888 => R8G8B8A8_SRGB,
+
+    Rgb888 => B8G8R8_SRGB,
+    Bgr888 => R8G8B8_SRGB,
 
     // PACK32 formats are equivalent to u32 instead of [u8; 4] and thus depend their layout depends the host
     // endian.
@@ -91,9 +94,25 @@ pub(crate) fn known_vk_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
         .filter_map(|&f| get_vk_format(f).map(move |vk| (f, vk)))
 }
 
-pub const MEM_FORMATS: &[(Fourcc, vk::Format)] = &[
-    (Fourcc::Argb8888, vk::Format::B8G8R8A8_SRGB),
-    (Fourcc::Xrgb8888, vk::Format::B8G8R8A8_SRGB),
-    (Fourcc::Abgr8888, vk::Format::R8G8B8A8_SRGB),
-    (Fourcc::Xbgr8888, vk::Format::R8G8B8A8_SRGB),
-];
+pub(crate) trait FormatExt {
+    fn has_alpha(self) -> bool;
+}
+
+impl FormatExt for vk::Format {
+    fn has_alpha(self) -> bool {
+        !matches!(
+            self,
+            vk::Format::B8G8R8_SRGB
+            | vk::Format::R8G8B8_SRGB
+        )
+    }
+}
+
+// pub const MEM_FORMATS: &[(Fourcc, vk::Format)] = &[
+//     (Fourcc::Argb8888, vk::Format::B8G8R8A8_UNORM),
+//     (Fourcc::Xrgb8888, vk::Format::B8G8R8A8_SRGB),
+//     (Fourcc::Abgr8888, vk::Format::R8G8B8A8_UNORM),
+//     (Fourcc::Xbgr8888, vk::Format::R8G8B8A8_SRGB),
+//     (Fourcc::Rgb888, vk::Format::B8G8R8_SRGB),
+//     (Fourcc::Bgr888, vk::Format::R8G8B8_SRGB),
+// ];

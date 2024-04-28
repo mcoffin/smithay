@@ -275,13 +275,18 @@ impl RenderSetup {
     }
 
     #[inline(always)]
-    pub fn quad_pipeline(&self) -> (vk::Pipeline, vk::PipelineLayout) {
-        (self.pipelines[0], self.layouts[0].layout)
+    fn pipeline_at(&self, index: usize) -> (vk::Pipeline, &PipelineLayout) {
+        (self.pipelines[index], &self.layouts[index])
     }
 
     #[inline(always)]
-    pub fn tex_pipeline(&self) -> vk::Pipeline {
-        self.pipelines[1]
+    pub(super) fn quad_pipeline(&self) -> (vk::Pipeline, &PipelineLayout) {
+        self.pipeline_at(0)
+    }
+
+    #[inline(always)]
+    pub(super) fn tex_pipeline(&self) -> (vk::Pipeline, &PipelineLayout) {
+        self.pipeline_at(1)
     }
 }
 
@@ -348,10 +353,10 @@ const fn color_attachment(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PipelineLayout {
-    layout: vk::PipelineLayout,
-    ds_layout: vk::DescriptorSetLayout,
-    sampler: vk::Sampler,
+pub(super) struct PipelineLayout {
+    pub layout: vk::PipelineLayout,
+    pub ds_layout: vk::DescriptorSetLayout,
+    pub sampler: vk::Sampler,
 }
 
 impl PipelineLayout {
