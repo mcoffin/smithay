@@ -24,6 +24,7 @@ pub struct Swapchain {
     images: Box<[SwapchainImage]>,
     pool: vk::CommandPool,
     pub(super) init_buffers: Box<[vk::CommandBuffer]>,
+    surface: vk::SurfaceKHR,
 }
 
 impl Swapchain {
@@ -141,6 +142,7 @@ impl Swapchain {
             init_buffers: ScopeGuard::into_inner(init_buffers),
             pool: ScopeGuard::into_inner(pool),
             device,
+            surface,
         })
     }
 
@@ -176,6 +178,12 @@ impl Swapchain {
     #[inline(always)]
     pub fn format(&self) -> vk::Format {
         self.format.format
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn surface(&self) -> vk::SurfaceKHR {
+        self.surface
     }
 
     pub(super) fn acquire(

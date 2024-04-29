@@ -112,6 +112,32 @@ pub struct VulkanRenderer {
     pending_frames: LinkedList<SubmittedFrame>,
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! vk_call {
+    ($dev:expr, $fn_name:ident ($($arg:expr),+ $(,)?)) => {
+        unsafe {
+            $dev.$fn_name($($arg),+)
+                .vk(concat!("vk_", stringify!($create_fn)))
+        }
+    };
+    ($e:expr, $fname:expr) => {
+        unsafe { $e }.vk($fname)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! vk_create_guarded {
+    ($dev:expr, $create_fn:ident ($($create_expr:expr),+), $destroy_fn:ident ($($destroy_expr:expr),+)) => {
+        unsafe { $dev.$create_fn($($create_expr),+) }
+            .vk(concat!("vk_", stringify!($create_fn)))
+            .map(|v| scopeguard::guard(v, |v| unsafe {
+                $dev.$destroy_fn(v, $($destroy_expr),+);
+            }))
+    };
+}
+
 impl VulkanRenderer {
     /// Creates a new [`VulkanRenderer`] from this [`PhysicalDevice`]. The renderer is initially
     /// bound to *no target*, meaning calling [`Renderer::render`] without first binding to a valid
@@ -339,10 +365,21 @@ impl VulkanRenderer {
         self.cleanup_pending_threshold(5)
     }
 
-    fn collect_pending(&mut self) -> impl Iterator<Item=SubmittedFrame> + '_ {
+    fn all_pending(&mut self) -> impl Iterator<Item=SubmittedFrame> + '_ {
         let pending = mem::take(&mut self.pending_frames);
         let (_, rx) = &self.submitted_frames;
         rx.try_iter().chain(pending)
+    }
+
+    fn wait_all_pending(&mut self) -> Result<(), Error<'static>> {
+        let frames = self.all_pending()
+            .collect::<Vec<_>>();
+        let mut fences = Vec::with_capacity(frames.len());
+        fences.extend(frames.iter().map(|&SubmittedFrame { fence, .. }| fence));
+        if !fences.is_empty() {
+            vk_call!(self.device(), wait_for_fences(fences.as_slice(), true, u64::MAX))?;
+        }
+        Ok(())
     }
 
     /// Gets a list of all images that need to be transitioned to a correct layout
@@ -413,32 +450,6 @@ impl<'a> Iterator for CheckPending<'a> {
     }
 }
 
-#[doc(hidden)]
-#[macro_export]
-macro_rules! vk_call {
-    ($dev:expr, $fn_name:ident ($($arg:expr),+ $(,)?)) => {
-        unsafe {
-            $dev.$fn_name($($arg),+)
-                .vk(concat!("vk_", stringify!($create_fn)))
-        }
-    };
-    ($e:expr, $fname:expr) => {
-        unsafe { $e }.vk($fname)
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! vk_create_guarded {
-    ($dev:expr, $create_fn:ident ($($create_expr:expr),+), $destroy_fn:ident ($($destroy_expr:expr),+)) => {
-        unsafe { $dev.$create_fn($($create_expr),+) }
-            .vk(concat!("vk_", stringify!($create_fn)))
-            .map(|v| scopeguard::guard(v, |v| unsafe {
-                $dev.$destroy_fn(v, $($destroy_expr),+);
-            }))
-    };
-}
-
 macro_rules! mocked {
     () => {
         warn!("mocked: {}", fn_name!());
@@ -483,32 +494,14 @@ impl Renderer for VulkanRenderer {
         output_size: Size<i32, Physical>,
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
-        use std::mem::MaybeUninit;
         let mut prev = self.cleanup();
         // self.cleanup(|f| {
         //     prev = Some(f);
         //     true
         // })?;
         let target = self.target.as_ref().ok_or(Error::NoTarget)?;
-        let new_command_buffer = || unsafe {
-            let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
-            let alloc_info = vk::CommandBufferAllocateInfo::builder()
-                .command_pool(*self.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1)
-                .build();
-            let result = (self.device().fp_v1_0().allocate_command_buffers)(
-                self.device().handle(),
-                &alloc_info as *const _,
-                ret.as_mut_ptr(),
-            );
-            match result {
-                vk::Result::SUCCESS => Ok(ret.assume_init()),
-                e => Err(Error::Vk {
-                    context: "vkAllocateCommandBuffers",
-                    result: e,
-                }),
-            }
+        let new_command_buffer = || {
+            self.device().create_single_command_buffer(*self.command_pool, vk::CommandBufferLevel::PRIMARY)
         };
         let command_buffer = if let Some(command_buffer) = prev.as_mut().map(|f| mem::take(&mut f.command_buffer)) {
             unsafe {
@@ -707,7 +700,8 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
             Some(tgt) if tgt == &*target => Ok(()),
             _ => {
                 use swapchain::SupportDetails;
-                let pending_frames = self.collect_pending().collect::<Vec<_>>();
+                debug!("waiting on pending/in-flight frames to complete");
+                self.wait_all_pending()?;
 
                 let swapchain_support = SupportDetails::with_surface(
                     self.phd.handle(),
@@ -721,27 +715,13 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                 let render_setup = self.render_setups.get(&format)
                     .ok_or(Error::RendererSetup(format))?;
 
-                let mut fences = Vec::with_capacity(pending_frames.len());
-                fences.extend(pending_frames.iter()
-                    .filter_map(|&SubmittedFrame { fence, .. }| if fence != vk::Fence::null() {
-                        Some(fence)
-                    } else {
-                        None
-                    }));
-                unsafe {
-                    debug!(n_fences = fences.len(), "waiting on in-flight frames");
-                    if !fences.is_empty() {
-                        self.device().wait_for_fences(fences.as_slice(), true, u64::MAX)
-                            .vk("vkWaitForFences")
-                    } else {
-                        Ok(())
-                    }
-                }?;
-                debug!(?pending_frames, "dropping pending_frames");
-                std::mem::drop(pending_frames);
+                if matches!(
+                    &self.target,
+                    Some(VulkanTarget::Surface(_, swapchain)) if swapchain.surface() == target.handle()
+                ) {
+                    self.target = None;
+                }
 
-                debug!("destroying old target");
-                self.target = None;
                 let swapchain = Swapchain::with_surface(
                     &*self,
                     swapchain::SurfaceInfo::new(
@@ -1072,6 +1052,7 @@ impl SurfaceExtVulkan for compositor::SurfaceData {
 }
 
 impl ImportMemWl for VulkanRenderer {
+    #[tracing::instrument(skip(self, _damage))]
     fn import_shm_buffer(
         &mut self,
         buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
@@ -1088,6 +1069,7 @@ impl ImportMemWl for VulkanRenderer {
                 // otherwise create a new image
                 let device = self.device();
                 let fmt = Format::try_from(shm_format)?;
+                debug!(?fmt, "found format for shm buffer");
                 let queue_family_indices = &[self.queues.graphics.index as u32];
                 let info = vk::ImageCreateInfo::builder()
                     .flags(vk::ImageCreateFlags::empty())
@@ -1124,7 +1106,7 @@ impl ImportMemWl for VulkanRenderer {
                 let memory = vk_create_guarded!(device, allocate_memory(&info, None), free_memory(None))?;
                 vk_call!(device, bind_image_memory(*image, *memory, 0))?;
                 let buffer = StagingBuffer::new(self, len as vk::DeviceSize, vk::SharingMode::EXCLUSIVE)?;
-                Arc::new(InnerImage {
+                let mut ret = InnerImage {
                     image: ScopeGuard::into_inner(image),
                     memories: [vk::DeviceMemory::null(); MAX_PLANES],
                     buffer: Some(buffer),
@@ -1133,9 +1115,12 @@ impl ImportMemWl for VulkanRenderer {
                     views: RefCell::new(Vec::new()),
                     layout: Cell::new(vk::ImageLayout::UNDEFINED),
                     device: Arc::downgrade(&self.device),
-                })
+                };
+                ret.memories[0] = ScopeGuard::into_inner(memory);
+                Arc::new(ret)
             };
 
+            // update data in staging buffer
             let b_data = unsafe {
                 std::slice::from_raw_parts(ptr.offset(offset as isize), len)
             };
@@ -1143,6 +1128,7 @@ impl ImportMemWl for VulkanRenderer {
                 .expect("shm image must have a buffer");
             buffer.upload(b_data, offset as vk::DeviceSize)?;
 
+            // submit a copy from the staging buffer to the main image
             let cb = self.device.create_single_command_buffer(
                 *self.command_pool,
                 vk::CommandBufferLevel::PRIMARY,
