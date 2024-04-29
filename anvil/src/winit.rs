@@ -12,6 +12,7 @@ use smithay::{
     backend::{allocator::Fourcc, renderer::ImportMem},
     reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle},
 };
+use tracing::debug;
 
 use smithay::{
     backend::{
@@ -116,6 +117,7 @@ impl<G: WinitGraphics> Backend for WinitData<G> {
 
 type WinitInitFn<G> = fn() -> Result<(WinitGraphicsBackend<G>, WinitEventLoop), WinitError>;
 
+#[tracing::instrument(skip_all, name = "winit_loop")]
 fn run_winit<G>(init_fn: WinitInitFn<G>) 
 where
     G: WinitGraphics + 'static,
@@ -250,21 +252,27 @@ where
     let mut pointer_element = PointerElement::default();
 
     while state.running.load(Ordering::SeqCst) {
-        let status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { size, .. } => {
-                // We only have one output
-                let output = state.space.outputs().next().unwrap().clone();
-                state.space.map_output(&output, (0, 0));
-                let mode = Mode {
-                    size,
-                    refresh: 60_000,
-                };
-                output.change_current_state(Some(mode), None, None, None);
-                output.set_preferred(mode);
-                crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+        let status = winit.dispatch_new_events(|event| {
+            debug!(?event, "got winit event");
+            match event {
+                WinitEvent::Resized { size, .. } => {
+                    // We only have one output
+                    let output = state.space.outputs().next().unwrap().clone();
+                    state.space.map_output(&output, (0, 0));
+                    let mode = Mode {
+                        size,
+                        refresh: 60_000,
+                    };
+                    output.change_current_state(Some(mode), None, None, None);
+                    output.set_preferred(mode);
+                    crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+                }
+                WinitEvent::Input(event) =>
+                    state.process_input_event_windowed(event, OUTPUT_NAME),
+                WinitEvent::CloseRequested =>
+                    state.running.store(false, Ordering::SeqCst),
+                _ => (),
             }
-            WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
-            _ => (),
         });
 
         if let PumpStatus::Exit(_) = status {
