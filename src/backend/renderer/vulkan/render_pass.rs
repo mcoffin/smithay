@@ -449,3 +449,17 @@ impl From<vk::PipelineLayout> for PipelineLayout {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{
+        offset_of,
+        size_of,
+    };
+
+    #[test]
+    fn uniform_data_offset_matches() {
+        assert_eq!(offset_of!(UniformData, frag), 80);
+    }
+}

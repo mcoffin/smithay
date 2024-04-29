@@ -24,27 +24,20 @@ use ash::{
 };
 use cgmath::{
     prelude::*,
-    Matrix3,
     Matrix4,
     Vector2,
 };
 use scopeguard::ScopeGuard;
 use std::{
-    borrow::Cow,
-    cell::{
+    borrow::Cow, cell::{
         Cell,
         RefCell,
-    },
-    collections::HashMap,
-    fmt,
-    mem,
-    ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, IntoRawFd},
-    rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Weak,
-    },
+    }, collections::{
+        HashMap,
+        LinkedList,
+    }, fmt, mem, num::NonZeroU64, ops::{Deref, DerefMut}, os::fd::{AsRawFd, IntoRawFd}, rc::Rc, sync::{
+        atomic::Ordering, mpsc, Arc, Weak
+    }
 };
 
 #[allow(unused_imports)]
@@ -71,8 +64,6 @@ use render_pass::{
 use memory::DeviceExtMemory;
 use transform::TransformExt;
 
-type Mat3 = Matrix3<f32>;
-
 /// [`Renderer`] implementation using the [`vulkan`](https://www.vulkan.org/) graphics API
 #[derive(Debug)]
 pub struct VulkanRenderer {
@@ -85,12 +76,15 @@ pub struct VulkanRenderer {
     extensions: Extensions,
     debug_flags: DebugFlags,
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
+    shm_images: Vec<WeakVulkanImage>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     command_pool: OwnedHandle<vk::CommandPool, Device>,
     target: Option<VulkanTarget>,
     upscale_filter: vk::Filter,
     downscale_filter: vk::Filter,
     render_setups: HashMap<vk::Format, RenderSetup>,
+    submitted_frames: (mpsc::Sender<SubmittedFrame>, mpsc::Receiver<SubmittedFrame>),
+    pending_frames: LinkedList<SubmittedFrame>,
 }
 
 impl VulkanRenderer {
@@ -156,7 +150,7 @@ impl VulkanRenderer {
         let device = Arc::new(device);
 
         let mut pool_info = vk::CommandPoolCreateInfo::builder()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(queues.graphics.index as _)
             .build();
         let pool = unsafe {
@@ -179,12 +173,15 @@ impl VulkanRenderer {
             extensions,
             debug_flags: DebugFlags::empty(),
             dmabuf_cache: HashMap::new(),
+            shm_images: Vec::new(),
             memory_props,
             command_pool: pool,
             target: None,
             upscale_filter: vk::Filter::LINEAR,
             downscale_filter: vk::Filter::LINEAR,
             render_setups: HashMap::new(),
+            submitted_frames: mpsc::channel(),
+            pending_frames: LinkedList::new(),
         })
     }
 
@@ -278,9 +275,103 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    fn cleanup(&mut self) -> Result<(), Error<'static>> {
+    fn cleanup<F>(&mut self, mut cb: F) -> Result<(), Error<'static>>
+    where
+        F: FnMut(SubmittedFrame) -> bool,
+    {
         self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
+        self.shm_images.retain(|img| img.upgrade().is_some());
+
+        // flush pending frames into list
+        let mut cb_enabled = true;
+        let (_, rx) = &self.submitted_frames;
+        while let Ok(v) = rx.try_recv() {
+            if !v.is_done() || !cb_enabled {
+                self.pending_frames.push_back(v);
+            } else {
+                cb_enabled = !cb(v);
+            }
+        }
+        if cb_enabled {
+            self.clean_pending_frames(cb)
+        } else {
+            self.clean_pending_frames(|_| false);
+        }
         Ok(())
+    }
+
+    fn clean_pending_frames<F>(&mut self, mut cb: F)
+    where
+        F: FnMut(SubmittedFrame) -> bool,
+    {
+        if self.pending_frames.is_empty() {
+            return;
+        }
+        let mut cursor = self.pending_frames.cursor_front_mut();
+        while cursor.current().is_some() {
+            if cursor.current().filter(|f| f.is_done()).is_some() {
+                if cb(cursor.remove_current().unwrap()) {
+                    return;
+                }
+            } else {
+                cursor.move_next();
+            }
+        }
+    }
+
+    fn collect_pending(&mut self) -> impl Iterator<Item=SubmittedFrame> + '_ {
+        let pending = mem::take(&mut self.pending_frames);
+        let (_, rx) = &self.submitted_frames;
+        rx.try_iter().chain(pending)
+    }
+
+    /// Gets a list of all images that need to be transitioned to a correct layout
+    /// (`desired_layout`) before rendering
+    fn images_needing_transition(&self, desired_layout: vk::ImageLayout) -> impl Iterator<Item=VulkanImage> + '_ {
+        let dmabuf_it = self.dmabuf_cache.iter()
+            .filter_map(move |(_, image)| if image.0.layout.get() != desired_layout {
+                Some(image.clone())
+            } else {
+                None
+            });
+        let shm_it = self.shm_images.iter()
+            .filter_map(|img| img.upgrade())
+            .filter(move |img| img.layout.get() != desired_layout)
+            .map(VulkanImage);
+        dmabuf_it
+            .chain(shm_it)
+    }
+
+    fn cmd_transition_images(&self, command_buffer: vk::CommandBuffer, desired_layout: vk::ImageLayout) -> bool {
+        let mut transition_it = self.images_needing_transition(desired_layout)
+            .peekable();
+        let ret = transition_it.has_next();
+        if ret {
+            let graphics_idx = self.queues.graphics.idx();
+            let barriers = transition_it.map(|image| {
+                image.0.layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(desired_layout)
+                    .src_queue_family_index(graphics_idx)
+                    .dst_queue_family_index(graphics_idx)
+                    .image(image.0.image)
+                    .subresource_range(COLOR_SINGLE_LAYER)
+                    .build()
+            }).collect::<Vec<_>>();
+            unsafe {
+                self.device().cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], barriers.as_slice()
+                );
+            }
+        }
+        ret
     }
 }
 
@@ -334,9 +425,13 @@ impl Renderer for VulkanRenderer {
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
         use std::mem::MaybeUninit;
-        self.cleanup()?;
+        let mut prev = None;
+        self.cleanup(|f| {
+            prev = Some(f);
+            true
+        })?;
         let target = self.target.as_ref().ok_or(Error::NoTarget)?;
-        let command_buffer = unsafe {
+        let new_command_buffer = || unsafe {
             let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
             let alloc_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(*self.command_pool)
@@ -355,79 +450,74 @@ impl Renderer for VulkanRenderer {
                     result: e,
                 }),
             }
-        }?;
+        };
+        let command_buffer = if let Some(command_buffer) = prev.as_mut().map(|f| mem::take(&mut f.command_buffer)) {
+            unsafe {
+                self.device().reset_command_buffer(
+                    command_buffer,
+                    vk::CommandBufferResetFlags::RELEASE_RESOURCES
+                )
+            }
+                .vk("vkResetCommandBuffer")
+                .map(|_| command_buffer)
+                .or_else(|e| {
+                    warn!("error resetting command buffer: {}", &e);
+                    new_command_buffer()
+                })
+        } else {
+            new_command_buffer()
+        }.map(|v| scopeguard::guard(v, |v| unsafe {
+            self.device().free_command_buffers(*self.command_pool, &[v]);
+        }))?;
+
         let format = match target {
             VulkanTarget::Surface(_, swapchain) => swapchain.format(),
         };
         let setup = self.render_setups.get(&format)
             .expect("render setup did not exist");
-        let mut ret = VulkanFrame {
-            renderer: self,
-            target,
-            setup,
-            command_buffer,
-            image: vk::Image::null(),
-            image_idx: 0,
-            image_ready: [vk::Semaphore::null(); 2],
-            submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
-            output_size,
-            bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
-        };
+        // let mut ret = VulkanFrame {
+        //     renderer: self,
+        //     target,
+        //     setup,
+        //     command_buffer,
+        //     image: vk::Image::null(),
+        //     image_idx: 0,
+        //     image_ready: [vk::Semaphore::null(); 2],
+        //     submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
+        //     output_size,
+        //     bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
+        // };
 
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
-            self.device().begin_command_buffer(ret.command_buffer, &begin_info)
+            self.device().begin_command_buffer(*command_buffer, &begin_info)
         }.vk("vkBeginCommandBuffer")?;
 
-        let mut dmabuf_it = self.dmabuf_cache.iter()
-            .filter_map(|(_, image)| if image.0.layout.get() != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                Some(image)
-            } else {
-                None
-            })
-            .peekable();
-        if dmabuf_it.peek().is_some() {
-            let barriers = dmabuf_it.map(|image| {
-                image.0.layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-                vk::ImageMemoryBarrier::builder()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image.0.image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .build()
-            }).collect::<Vec<_>>();
-            unsafe {
-                self.device().cmd_pipeline_barrier(
-                    ret.command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[], &[], barriers.as_slice()
-                );
-            }
-        }
+        self.cmd_transition_images(*command_buffer, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-        let (fmt, extent, framebuffer) = match &ret.target {
+        let (
+            image,
+            image_idx,
+            extent,
+            framebuffer,
+            image_ready,
+            submit_ready,
+        ) = match target {
             VulkanTarget::Surface(_, swapchain) => {
-                // TODO: fixme fuck
-                ret.image_ready[0] = unsafe {
-                    let info = vk::SemaphoreCreateInfo::builder()
-                        .flags(vk::SemaphoreCreateFlags::empty())
-                        .build();
-                    self.device().create_semaphore(&info, None)
-                }.vk("vkCreateSemaphore")?;
-                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(ret.image_ready[0]))
+                let image_ready = prev.as_mut()
+                    .and_then(SubmittedFrame::take_image_ready)
+                    .map_or_else(|| unsafe {
+                        let info = vk::SemaphoreCreateInfo::builder()
+                            .flags(vk::SemaphoreCreateFlags::empty())
+                            .build();
+                        self.device().create_semaphore(&info, None)
+                            .vk("vkCreateSemaphore")
+                    }, Ok)
+                    .map(|v| scopeguard::guard(v, |v| unsafe {
+                        self.device().destroy_semaphore(v, None);
+                    }))?;
+                let (image_idx, swap_image) = swapchain.acquire(u64::MAX, From::from(*image_ready))
                     .or_else(|e| match e {
                         swapchain::AcquireError::Suboptimal(v) => {
                             warn!(?swapchain, "suboptimal swapchain");
@@ -440,7 +530,7 @@ impl Renderer for VulkanRenderer {
                     unsafe {
                         let idx = image_idx as usize;
                         self.device().cmd_execute_commands(
-                            ret.command_buffer,
+                            *command_buffer,
                             &swapchain.init_buffers[idx..(idx+1)],
                         );
                     }
@@ -452,9 +542,9 @@ impl Renderer for VulkanRenderer {
                     vk::ImageLayout::PRESENT_SRC_KHR,
                     vk::PipelineStageFlags::TOP_OF_PIPE)
                 };
-                ret.image = swap_image.image;
-                ret.image_idx = image_idx;
-                ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
+                // ret.image = swap_image.image;
+                // ret.image_idx = image_idx;
+                // ret.submit_ready = MaybeOwned::Borrowed(swap_image.submit_semaphore);
                 let acquire_access =
                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::COLOR_ATTACHMENT_READ;
@@ -466,16 +556,10 @@ impl Renderer for VulkanRenderer {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(swap_image.image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
+                    .subresource_range(COLOR_SINGLE_LAYER);
                 unsafe {
                     self.device().cmd_pipeline_barrier(
-                        ret.command_buffer,
+                        *command_buffer,
                         src_stage,
                         vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                         | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -483,41 +567,56 @@ impl Renderer for VulkanRenderer {
                         &[], &[], &[acquire_barrier.build()]
                     );
                 }
-                (swapchain.format(), *swapchain.extent(), swap_image.framebuffer)
+                (
+                    swap_image.image,
+                    image_idx,
+                    *swapchain.extent(),
+                    swap_image.framebuffer,
+                    ScopeGuard::into_inner(image_ready),
+                    swap_image.submit_semaphore,
+                )
             },
         };
-        let render_setup = self.render_setups.get(&fmt).unwrap();
+        let submit_ready = if submit_ready != vk::Semaphore::null() {
+            MaybeOwned::Borrowed(submit_ready)
+        } else {
+            MaybeOwned::Owned(vk::Semaphore::null())
+        };
+        let submit_fence = prev.as_mut()
+            .and_then(SubmittedFrame::take_fence)
+            .unwrap_or_else(Default::default);
 
+        let ret = VulkanFrame {
+            renderer: self,
+            target,
+            setup,
+            command_buffer: ScopeGuard::into_inner(command_buffer),
+            image,
+            image_idx,
+            image_ready: [
+                image_ready,
+                vk::Semaphore::null(),
+            ],
+            submit_ready,
+            submit_fence,
+            output_size,
+            bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
+            submitted_rx: self.submitted_frames.0.clone(),
+        };
+        let cb = ret.command_buffer;
         let begin_info = vk::RenderPassBeginInfo::builder()
-            .render_pass(render_setup.render_pass())
+            .render_pass(setup.render_pass())
             .framebuffer(framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
             });
-            // .clear_values(&[
-            //     vk::ClearValue {
-            //         color: vk::ClearColorValue {
-            //             float32: [0f32; 4],
-            //         },
-            //     },
-            // ]);
-        let cb = ret.command_buffer;
+        debug_assert_eq!(ret.output_size.w as u32, extent.width);
+        debug_assert_eq!(ret.output_size.h as u32, extent.height);
         unsafe {
             self.device().cmd_begin_render_pass(cb, &begin_info, vk::SubpassContents::INLINE);
-            self.device().cmd_set_viewport(cb, 0, &[
-                vk::Viewport {
-                    x: 0f32, y: 0f32,
-                    width: extent.width as _, height: extent.height as _,
-                    min_depth: 0f32, max_depth: 1f32,
-                },
-            ]);
-            self.device().cmd_set_scissor(cb, 0, &[
-                vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                }
-            ]);
+            ret.reset_viewport();
+            ret.reset_scissor();
         }
         Ok(ret)
     }
@@ -550,6 +649,8 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
             Some(tgt) if tgt == &*target => Ok(()),
             _ => {
                 use swapchain::SupportDetails;
+                let pending_frames = self.collect_pending().collect::<Vec<_>>();
+
                 let swapchain_support = SupportDetails::with_surface(
                     self.phd.handle(),
                     target.handle(),
@@ -561,6 +662,27 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                 self.ensure_render_setup(format)?;
                 let render_setup = self.render_setups.get(&format)
                     .ok_or(Error::RendererSetup(format))?;
+
+                let mut fences = Vec::with_capacity(pending_frames.len());
+                pending_frames.iter()
+                    .filter_map(|&SubmittedFrame { fence, .. }| if fence != vk::Fence::null() {
+                        Some(fence)
+                    } else {
+                        None
+                    })
+                    .zip(fences.iter_mut())
+                    .for_each(|(fence, out)| {
+                        *out = fence;
+                    });
+                unsafe {
+                    if !fences.is_empty() {
+                        self.device().wait_for_fences(fences.as_slice(), true, u64::MAX)
+                            .vk("vkWaitForFences")
+                    } else {
+                        Ok(())
+                    }
+                }?;
+                std::mem::drop(pending_frames);
 
                 self.target = None;
                 let swapchain = Swapchain::with_surface(
@@ -802,7 +924,7 @@ impl ImportDma for VulkanRenderer {
             "vkBindImageMemory2"
         )?;
 
-        let mut image = InnerImage {
+        let image = VulkanImage::new(InnerImage {
             image: ScopeGuard::into_inner(image),
             memories: ScopeGuard::into_inner(memories),
             buffer: vk::Buffer::null(),
@@ -811,8 +933,7 @@ impl ImportDma for VulkanRenderer {
             views: RefCell::new(Vec::new()),
             layout: Cell::new(vk::ImageLayout::UNDEFINED),
             device: Arc::downgrade(&self.device),
-        };
-        let image = VulkanImage::new(image);
+        });
         self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
         Ok(image)
     }
@@ -1161,6 +1282,99 @@ impl<T> Deref for MaybeOwned<T> {
     }
 }
 
+/// Contains handles that need to live on past [`Frame::finish`]
+#[derive(Debug)]
+struct SubmittedFrame {
+    command_buffer: vk::CommandBuffer,
+    command_pool: vk::CommandPool,
+    image_ready: Option<NonZeroU64>,
+    fence: vk::Fence,
+    device: Arc<Device>,
+}
+
+impl SubmittedFrame {
+    #[inline(always)]
+    fn from_frame(frame: &mut VulkanFrame<'_>, fence: vk::Fence) -> Self {
+        use vk::Handle;
+        let image_ready = mem::take(&mut frame.image_ready[0]);
+        SubmittedFrame {
+            command_buffer: mem::take(&mut frame.command_buffer),
+            command_pool: *frame.renderer.command_pool,
+            image_ready: NonZeroU64::new(image_ready.as_raw()),
+            fence,
+            device: frame.renderer.device.clone(),
+        }
+    }
+
+    #[inline(always)]
+    fn command_buffer_valid(&self) -> bool {
+        !self.command_buffer.is_null() && !self.command_pool.is_null()
+    }
+
+    #[inline(always)]
+    fn status(&self) -> Result<FenceStatus, vk::Result> {
+        self.device.fence_status(self.fence)
+    }
+
+    fn is_done(&self) -> bool {
+        match self.status() {
+            Ok(FenceStatus::Signaled) => true,
+            Ok(FenceStatus::Unsignaled) => false,
+            Err(error) => {
+                error!(?error, "error getting fence status");
+                false
+            },
+        }
+    }
+
+    #[inline]
+    fn wait(&self, timeout: u64) -> Result<(), vk::Result> {
+        unsafe {
+            self.device.wait_for_fences(&[self.fence], true, timeout)
+        }
+    }
+
+    #[inline(always)]
+    fn take_image_ready(&mut self) -> Option<vk::Semaphore> {
+        use vk::Handle;
+        self.image_ready.take()
+            .map(|v| vk::Semaphore::from_raw(v.get()))
+    }
+
+    fn take_fence(&mut self) -> Option<vk::Fence> {
+        Some(mem::take(&mut self.fence))
+            .filter(|v| !v.is_null())
+            .and_then(|fence| unsafe {
+                match self.device.reset_fences(&[fence]).vk("vkResetFences") {
+                    Ok(..) => Some(fence),
+                    Err(error) => {
+                        error!(?error, "error resetting fence");
+                        self.fence = fence;
+                        None
+                    },
+                }
+            })
+    }
+}
+
+impl Drop for SubmittedFrame {
+    fn drop(&mut self) {
+        use vk::Handle;
+        unsafe {
+            if !self.command_buffer.is_null() && !self.command_pool.is_null() {
+                self.device.free_command_buffers(self.command_pool, &[self.command_buffer]);
+            }
+            if let Some(v) = self.image_ready {
+                let v = vk::Semaphore::from_raw(v.get());
+                self.device.destroy_semaphore(v, None);
+            }
+            if !self.fence.is_null() {
+                self.device.destroy_fence(self.fence, None);
+            }
+        }
+    }
+}
+
 /// [`Frame`] implementation used by a [`VulkanRenderer`]
 ///
 /// * See [`Renderer`] and [`Frame`]
@@ -1174,8 +1388,10 @@ pub struct VulkanFrame<'a> {
     image_idx: u32,
     image_ready: [vk::Semaphore; 2],
     submit_ready: MaybeOwned<vk::Semaphore>,
+    submit_fence: vk::Fence,
     output_size: Size<i32, Physical>,
     bound_pipeline: (vk::Pipeline, vk::PipelineLayout),
+    submitted_rx: mpsc::Sender<SubmittedFrame>,
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
@@ -1188,14 +1404,17 @@ impl<'a> Drop for VulkanFrame<'a> {
                 },
                 _ => {},
             }
+            if !self.submit_fence.is_null() {
+                device.destroy_fence(self.submit_fence, None);
+            }
             self.image_ready.iter()
                 .copied()
-                .filter(|&v| v != vk::Semaphore::null())
+                .filter(|v| !v.is_null())
                 .for_each(|semaphore| {
                     device.destroy_semaphore(semaphore, None);
                 });
             if self.command_buffer != vk::CommandBuffer::null() {
-                self.renderer.device().free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
+                device.free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
             }
         }
     }
@@ -1251,6 +1470,20 @@ impl<'a> VulkanFrame<'a> {
                 }]
             );
         }
+    }
+
+    #[inline(always)]
+    unsafe fn reset_scissor(&self) {
+        let &Size { w, h, .. } = &self.output_size;
+        self.renderer.device().cmd_set_scissor(self.command_buffer, 0, &[
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: w as _,
+                    height: h as _,
+                },
+            }
+        ]);
     }
 
     unsafe fn rect_viewport<Coords>(&self, dst: &Rectangle<i32, Coords>) {
@@ -1415,11 +1648,24 @@ impl<'a> Frame for VulkanFrame<'a> {
         Transform::Normal
     }
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
-        let mut submit_fence = VulkanFence::new(self.renderer.device.clone(), false)
-            .vk("vkCreateFence")?;
-
         let cb = self.command_buffer;
         let device = self.renderer.device();
+
+        let fence_info = vk::FenceCreateInfo::builder()
+            .flags(vk::FenceCreateFlags::empty())
+            .build();
+        let submit_fence = mem::take(&mut self.submit_fence);
+        let submit_fence = if submit_fence != vk::Fence::null() {
+            Ok(submit_fence)
+        } else {
+            unsafe {
+                device.create_fence(&fence_info, None)
+                    .vk("vkCreateFence")
+            }
+        }.map(|v| scopeguard::guard(v, |v| unsafe {
+            device.destroy_fence(v, None);
+        }))?;
+
         unsafe {
             device.cmd_end_render_pass(cb);
             device.end_command_buffer(cb)
@@ -1444,7 +1690,7 @@ impl<'a> Frame for VulkanFrame<'a> {
             device.queue_submit(
                 self.renderer.queues.graphics.handle,
                 &[info.build()],
-                submit_fence.handle(),
+                *submit_fence,
             ).vk("vkQueueSubmit")?;
             if let VulkanTarget::Surface(_, swapchain) = &self.target {
                 let wait_sems = signal_semaphores;
@@ -1471,16 +1717,8 @@ impl<'a> Frame for VulkanFrame<'a> {
             }
         }
 
-        // give release-ownership of handles that need to outlive rendering ops to the fence
-        //
-        // NOTE: if the caller releases the resulting SyncPoint *before* the work is done, that
-        // ain't good (for now)
-        submit_fence.image_ready = self.image_ready;
-        self.image_ready = [vk::Semaphore::null(); 2];
-        submit_fence.cb = CommandBuffer::new(self.command_buffer, *self.renderer.command_pool);
-        self.command_buffer = vk::CommandBuffer::null();
-
-        Ok(SyncPoint::from(submit_fence))
+        let submitted = SubmittedFrame::from_frame(&mut self, ScopeGuard::into_inner(submit_fence));
+        Ok(SyncPoint::from(VulkanFence::new(submitted, self.renderer.submitted_frames.0.clone())))
     }
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         self.renderer.device.wait_fence_vk(sync)
@@ -1499,10 +1737,17 @@ struct Format {
 #[repr(transparent)]
 pub struct VulkanImage(Arc<InnerImage>);
 
+type WeakVulkanImage = Weak<InnerImage>;
+
 impl VulkanImage {
     #[inline(always)]
     fn new(img: InnerImage) -> Self {
         VulkanImage(Arc::new(img))
+    }
+
+    #[inline(always)]
+    fn downgrade(&self) -> WeakVulkanImage {
+        Arc::downgrade(&self.0)
     }
 }
 
@@ -1671,7 +1916,8 @@ impl InnerImage {
         }
         {
             let mut views = self.views.borrow_mut();
-            let view = InnerImageView::new(self, layout, 4)?;
+            // TODO: fuck this '4' cant be hard-coded
+            let view = InnerImageView::new(self, layout, 6)?;
             views.push((layout.ds_layout, view));
         }
         Ok(Ref::map(self.views.borrow(), |views| &views[views.len()-1].1))
@@ -1848,6 +2094,11 @@ impl Queue {
             ext.get_physical_device_surface_support(pd, self.index as _, surface)
         }.vk("vkGetPhysicalDeviceSurfaceSupportKHR")
     }
+
+    #[inline(always)]
+    fn idx(&self) -> u32 {
+        self.index as _
+    }
 }
 
 #[repr(transparent)]
@@ -1961,22 +2212,6 @@ impl<T> ErrorExt for VkResult<T> {
     }
 }
 
-trait BufferExtVulkan {
-    fn extent_2d(&self) -> vk::Extent2D;
-    #[inline(always)]
-    fn extent_3d(&self) -> vk::Extent3D {
-        vk::Extent3D::from(self.extent_2d())
-    }
-}
-impl<T: Buffer> BufferExtVulkan for T {
-    #[inline(always)]
-    fn extent_2d(&self) -> vk::Extent2D {
-        vk::Extent2D {
-            width: self.width(),
-            height: self.height(),
-        }
-    }
-}
 trait DeviceExt {
     fn memory_requirements(&self, image: vk::Image) -> vk::MemoryRequirements2;
     fn disjoint_memory_requirements(
@@ -2054,6 +2289,14 @@ impl DeviceExt for ash::Device {
     }
 }
 
+const COLOR_SINGLE_LAYER: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
 contextual_handles!(Device {
     vk::CommandPool = destroy_command_pool,
     vk::RenderPass = destroy_render_pass,
@@ -2062,4 +2305,6 @@ contextual_handles!(Device {
 vulkan_handles! {
     vk::CommandBuffer,
     vk::DeviceMemory,
+    vk::Semaphore,
+    vk::Fence,
 }

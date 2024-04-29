@@ -1,5 +1,8 @@
 use super::MAX_PLANES;
-use crate::backend::allocator::dmabuf::Dmabuf;
+use crate::backend::allocator::{
+    dmabuf::Dmabuf,
+    Buffer,
+};
 use ash::{extensions::khr::ExternalMemoryFd, vk};
 use std::{
     fmt,
@@ -112,5 +115,33 @@ impl ExternalMemoryFdExt for ExternalMemoryFd {
             props: ret,
             props_len: count,
         })
+    }
+}
+
+pub trait PeekableExt {
+    fn has_next(&mut self) -> bool;
+}
+
+impl<It: Iterator> PeekableExt for std::iter::Peekable<It> {
+    #[inline(always)]
+    fn has_next(&mut self) -> bool {
+        self.peek().is_some()
+    }
+}
+
+pub trait BufferExtVulkan {
+    fn extent_2d(&self) -> vk::Extent2D;
+    #[inline(always)]
+    fn extent_3d(&self) -> vk::Extent3D {
+        vk::Extent3D::from(self.extent_2d())
+    }
+}
+impl<T: Buffer> BufferExtVulkan for T {
+    #[inline(always)]
+    fn extent_2d(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: self.width(),
+            height: self.height(),
+        }
     }
 }

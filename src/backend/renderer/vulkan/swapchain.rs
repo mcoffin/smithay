@@ -12,7 +12,7 @@ use std::{
         atomic::AtomicBool,
     },
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
 pub struct Swapchain {
     device: Arc<super::Device>,
@@ -115,6 +115,12 @@ impl Swapchain {
                 [0f32, 0f32, 0f32, 1.0],
                 r.queues.graphics.index as _,
             )?;
+        }
+        {
+            let n_images = swap_images.len();
+            let present_mode = surface_info.present_mode;
+            let handle = *handle;
+            debug!(n_images, ?render_setup.format, ?present_mode, ?handle, "created swapchain");
         }
         Ok(Swapchain {
             handle: ScopeGuard::into_inner(handle),

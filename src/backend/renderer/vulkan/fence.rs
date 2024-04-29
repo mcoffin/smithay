@@ -1,5 +1,4 @@
 use ash::vk;
-use std::sync::Arc;
 use crate::{
     backend::renderer::sync::{Fence, SyncPoint}, fn_name
 };
@@ -7,97 +6,65 @@ use tracing::*;
 use super::{
     Error,
     ErrorExt,
+    SubmittedFrame,
 };
+use std::{
+    mem::ManuallyDrop,
+    sync::mpsc,
+};
+
 #[derive(Debug)]
 pub struct VulkanFence {
-    device: Arc<super::Device>,
-    handle: vk::Fence,
-    pub(super) image_ready: [vk::Semaphore; 2],
-    pub(super) cb: CommandBuffer,
+    frame: ManuallyDrop<SubmittedFrame>,
+    tx: mpsc::Sender<SubmittedFrame>,
 }
 
 impl VulkanFence {
-    pub fn new(device: Arc<super::Device>, signaled: bool) -> Result<Self, vk::Result> {
-        let flags = if signaled {
-            vk::FenceCreateFlags::SIGNALED
-        } else {
-            vk::FenceCreateFlags::empty()
-        };
-        let info = vk::FenceCreateInfo::builder()
-            .flags(flags)
-            .build();
-        let handle = unsafe {
-            device.create_fence(&info, None)
-        }?;
-        Ok(VulkanFence {
-            device,
-            handle,
-            image_ready: [vk::Semaphore::null(); 2],
-            cb: Default::default(),
-        })
+    #[inline(always)]
+    pub fn new(frame: SubmittedFrame, tx: mpsc::Sender<SubmittedFrame>) -> Self {
+        VulkanFence {
+            frame: ManuallyDrop::new(frame),
+            tx,
+        }
     }
 
     #[inline(always)]
     pub fn handle(&self) -> vk::Fence {
-        self.handle
+        self.frame.fence
     }
 
     #[inline]
     pub fn status(&self) -> Result<FenceStatus, vk::Result> {
-        if unsafe { self.device.get_fence_status(self.handle) }? {
-            Ok(FenceStatus::Signaled)
-        } else {
-            Ok(FenceStatus::Unsignaled)
-        }
+        self.frame.status()
     }
 }
 
 impl Drop for VulkanFence {
     fn drop(&mut self) {
-        match self.status() {
-            Ok(FenceStatus::Unsignaled) => if let Err(error) = unsafe {
-                self.device.wait_for_fences(&[self.handle], true, u64::MAX)
-            } {
-                error!(?error, "error waiting on fence in destructor");
-            },
-            Err(error) => {
-                error!(?error, "error getting fence status");
-            },
-            _ => {},
-        }
         unsafe {
-            if self.cb.is_valid() {
-                self.device.free_command_buffers(self.cb.pool, &self.cb.buffers);
-            }
-            self.image_ready.iter()
-                .copied()
-                .filter(|&v| v != vk::Semaphore::null())
-                .for_each(|sem| unsafe {
-                    self.device.destroy_semaphore(sem, None);
-                });
-            self.device.destroy_fence(self.handle, None);
+            let f = ManuallyDrop::take(&mut self.frame);
+            self.tx.send(f)
+                .expect("renderer did not exist to receive submitted frame info")
         }
     }
 }
 
 impl Fence for VulkanFence {
     fn is_signaled(&self) -> bool {
-        let ret = self.status();
-        if let Err(error) = &ret {
-            error!(?error, "{}", fn_name!());
-        }
         match self.status() {
             Ok(FenceStatus::Signaled) => true,
-            Err(..) => false,
-            _ => false,
+            Ok(FenceStatus::Unsignaled) => false,
+            Err(error) => {
+                error!(?error, "error getting vulkan fence status");
+                false
+            },
         }
     }
 
     fn wait(&self) -> Result<(), crate::backend::renderer::sync::Interrupted> {
         use crate::backend::renderer::sync::Interrupted;
-        unsafe {
-            self.device.wait_for_fences(&[self.handle], true, u64::MAX)
-        }.map_err(|_| Interrupted)
+        self.frame.wait(u64::MAX)
+            .map_err(|_| Interrupted)
     }
 
     fn is_exportable(&self) -> bool {
@@ -119,6 +86,11 @@ pub trait DeviceExtFence {
         wait_all: bool,
         timeout: u64
     ) -> Result<(), Error<'static>>;
+
+    fn fence_status(
+        &self,
+        fence: vk::Fence,
+    ) -> Result<FenceStatus, vk::Result>;
 
     /// Attempts to downcast this [`SyncPoint`] as a [`VulkanFence`], and preserve native results
     /// if so.
@@ -146,35 +118,18 @@ impl DeviceExtFence for ash::Device {
             self.wait_for_fences(fences, wait_all, timeout)
         }.vk("vkWaitOnFences")
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-pub struct CommandBuffer {
-    buffers: [vk::CommandBuffer; 1],
-    pool: vk::CommandPool,
-}
-
-impl CommandBuffer {
     #[inline(always)]
-    pub fn new(buffer: vk::CommandBuffer, pool: vk::CommandPool) -> Self {
-        CommandBuffer {
-            buffers: [buffer],
-            pool,
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        self.buffers[0] != vk::CommandBuffer::null() && self.pool != vk::CommandPool::null()
-    }
-}
-
-impl Default for CommandBuffer {
-    #[inline(always)]
-    fn default() -> Self {
-        CommandBuffer {
-            buffers: [vk::CommandBuffer::null(); 1],
-            pool: vk::CommandPool::null(),
-        }
+    fn fence_status(
+        &self,
+        fence: vk::Fence,
+    ) -> Result<FenceStatus, vk::Result> {
+        unsafe { self.get_fence_status(fence) }
+            .map(|ret| if ret {
+                FenceStatus::Signaled
+            } else {
+                FenceStatus::Unsignaled
+            })
     }
 }
 
