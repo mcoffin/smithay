@@ -15,7 +15,7 @@ impl TransformExt for Transform {
     fn to_matrix(&self) -> Mat4 {
         match self {
             Transform::Normal => Mat4::one(),
-            Transform::Flipped => Mat4::from_nonuniform_scale(1.0, -1.0, 1.0),
+            // Transform::Flipped => Mat4::from_nonuniform_scale(1.0, -1.0, 1.0),
             _ => todo!(),
         }
     }

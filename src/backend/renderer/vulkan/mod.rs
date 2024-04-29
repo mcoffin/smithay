@@ -1,3 +1,5 @@
+use self::buffer::StagingBuffer;
+
 use super::{ImportDma, ImportDmaWl, ImportMem, ImportMemWl};
 use crate::{
     backend::{
@@ -28,6 +30,7 @@ use cgmath::{
     Vector2,
 };
 use scopeguard::ScopeGuard;
+use wayland_server::protocol::wl_shm;
 use std::{
     borrow::Cow, cell::{
         Cell,
@@ -43,6 +46,7 @@ use std::{
 #[allow(unused_imports)]
 use tracing::{debug, error, trace, warn};
 
+mod buffer;
 mod command_pool;
 mod dmabuf;
 mod fence;
@@ -86,6 +90,13 @@ pub struct VulkanRenderer {
     submitted_frames: (mpsc::Sender<SubmittedFrame>, mpsc::Receiver<SubmittedFrame>),
     pending_frames: LinkedList<SubmittedFrame>,
 }
+
+const MAT4_MODEL_BOX: Matrix4::<f32> = Matrix4::new(
+    2.0, 0.0, 0.0, 0.0,
+    0.0, 2.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    -1.0, -1.0, 0.0, 1.0
+);
 
 impl VulkanRenderer {
     /// Creates a new [`VulkanRenderer`] from this [`PhysicalDevice`]. The renderer is initially
@@ -381,6 +392,18 @@ macro_rules! vk_call {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! vk_create_guarded {
+    ($dev:expr, $create_fn:ident ($($create_expr:expr),+), $destroy_fn:ident ($($destroy_expr:expr),+)) => {
+        unsafe { $dev.$create_fn($($create_expr),+) }
+            .vk(concat!("vk_", stringify!($create_fn)))
+            .map(|v| scopeguard::guard(v, |v| unsafe {
+                $dev.$destroy_fn(v, $($destroy_expr),+);
+            }))
+    };
+}
+
 macro_rules! mocked {
     () => {
         warn!("mocked: {}", fn_name!());
@@ -419,6 +442,7 @@ impl Renderer for VulkanRenderer {
     fn debug_flags(&self) -> DebugFlags {
         self.debug_flags
     }
+    #[tracing::instrument(skip(self))]
     fn render(
         &mut self,
         output_size: Size<i32, Physical>,
@@ -525,7 +549,6 @@ impl Renderer for VulkanRenderer {
                         },
                         swapchain::AcquireError::Vk(e) => Err(Error::from(e)),
                     })?;
-                trace!(image_idx, ?swap_image, "acquired image");
                 let (src_access, src_layout, src_stage) = if !swap_image.transitioned.fetch_or(true, Ordering::SeqCst) {
                     unsafe {
                         let idx = image_idx as usize;
@@ -641,6 +664,7 @@ impl PartialEq<crate::backend::vulkan::Surface> for VulkanTarget {
 }
 
 impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
+    #[tracing::instrument(skip(self))]
     fn bind(
         &mut self,
         target: Rc<crate::backend::vulkan::Surface>,
@@ -664,17 +688,14 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                     .ok_or(Error::RendererSetup(format))?;
 
                 let mut fences = Vec::with_capacity(pending_frames.len());
-                pending_frames.iter()
+                fences.extend(pending_frames.iter()
                     .filter_map(|&SubmittedFrame { fence, .. }| if fence != vk::Fence::null() {
                         Some(fence)
                     } else {
                         None
-                    })
-                    .zip(fences.iter_mut())
-                    .for_each(|(fence, out)| {
-                        *out = fence;
-                    });
+                    }));
                 unsafe {
+                    debug!(n_fences = fences.len(), "waiting on in-flight frames");
                     if !fences.is_empty() {
                         self.device().wait_for_fences(fences.as_slice(), true, u64::MAX)
                             .vk("vkWaitForFences")
@@ -682,8 +703,10 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                         Ok(())
                     }
                 }?;
+                debug!(?pending_frames, "dropping pending_frames");
                 std::mem::drop(pending_frames);
 
+                debug!("destroying old target");
                 self.target = None;
                 let swapchain = Swapchain::with_surface(
                     &*self,
@@ -724,6 +747,7 @@ fn imported_usage_flags() -> vk::ImageUsageFlags {
 }
 
 impl ImportDma for VulkanRenderer {
+    #[tracing::instrument(skip(self, _damage))]
     fn import_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
@@ -752,6 +776,7 @@ impl ImportDma for VulkanRenderer {
         let fmt = self
             .format_for_drm(&dmabuf.format())
             .ok_or(Error::UnknownFormat(dmabuf.format()))?;
+        debug!(?fmt, ?dmabuf, "found format for dmabuf");
 
         let disjoint = dmabuf.is_disjoint()?;
         let image_create_flags = if disjoint {
@@ -927,7 +952,7 @@ impl ImportDma for VulkanRenderer {
         let image = VulkanImage::new(InnerImage {
             image: ScopeGuard::into_inner(image),
             memories: ScopeGuard::into_inner(memories),
-            buffer: vk::Buffer::null(),
+            buffer: None,
             dimensions: (width, height),
             format: fmt,
             views: RefCell::new(Vec::new()),
@@ -971,240 +996,241 @@ impl ImportMem for VulkanRenderer {
         size: Size<i32, BufferCoord>,
         _flipped: bool,
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        let vk_format = mem_formats()
-            .find_map(|(fmt, vk_fmt)| if fmt == format {
-                Some(vk_fmt)
-            } else {
-                None
-            })
-            .ok_or(Error::UnknownMemoryFormat(format))?;
-        let device = self.device();
-        let queue_indices = [self.queues.graphics.index as u32];
-        let create_info = vk::ImageCreateInfo::builder()
-            .flags(vk::ImageCreateFlags::empty())
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk_format)
-            .extent(vk::Extent3D {
-                width: size.w as _,
-                height: size.h as _,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(imported_usage_flags())
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .queue_family_indices(&queue_indices);
-        let image = unsafe {
-            device.create_image(&create_info, None)
-        }
-            .vk("vkCreateImage")
-            .map(|v| scopeguard::guard(v, |v| unsafe {
-                device.destroy_image(v, None);
-            }))?;
-        let image_reqs = unsafe {
-            device.get_image_memory_requirements(*image)
-        };
-        let allocate_memory = |size: vk::DeviceSize, idx: u32| {
-            let info = vk::MemoryAllocateInfo::builder()
-                .allocation_size(size)
-                .memory_type_index(idx)
-                .build();
-            unsafe {
-                device.allocate_memory(&info, None)
-            }
-                .vk("vkAllocateMemory")
-                .map(|v| scopeguard::guard(v, |v| unsafe {
-                    device.free_memory(v, None)
-                }))
-        };
-        let (mem_idx, ..) = self.find_memory_type(image_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            .ok_or(Error::NoMemoryType {
-                bits: image_reqs.memory_type_bits,
-                flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            })?;
-        let image_mem = allocate_memory(image_reqs.size, mem_idx as _)?;
-        unsafe {
-            device.bind_image_memory(*image, *image_mem, 0)
-        }.vk("vkBindImageMemory")?;
+        // let vk_format = mem_formats()
+        //     .find_map(|(fmt, vk_fmt)| if fmt == format {
+        //         Some(vk_fmt)
+        //     } else {
+        //         None
+        //     })
+        //     .ok_or(Error::UnknownMemoryFormat(format))?;
+        // let device = self.device();
+        // let queue_indices = [self.queues.graphics.index as u32];
+        // let create_info = vk::ImageCreateInfo::builder()
+        //     .flags(vk::ImageCreateFlags::empty())
+        //     .image_type(vk::ImageType::TYPE_2D)
+        //     .format(vk_format)
+        //     .extent(vk::Extent3D {
+        //         width: size.w as _,
+        //         height: size.h as _,
+        //         depth: 1,
+        //     })
+        //     .mip_levels(1)
+        //     .array_layers(1)
+        //     .samples(vk::SampleCountFlags::TYPE_1)
+        //     .tiling(vk::ImageTiling::OPTIMAL)
+        //     .usage(imported_usage_flags())
+        //     .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        //     .initial_layout(vk::ImageLayout::UNDEFINED)
+        //     .queue_family_indices(&queue_indices);
+        // let image = unsafe {
+        //     device.create_image(&create_info, None)
+        // }
+        //     .vk("vkCreateImage")
+        //     .map(|v| scopeguard::guard(v, |v| unsafe {
+        //         device.destroy_image(v, None);
+        //     }))?;
+        // let image_reqs = unsafe {
+        //     device.get_image_memory_requirements(*image)
+        // };
+        // let allocate_memory = |size: vk::DeviceSize, idx: u32| {
+        //     let info = vk::MemoryAllocateInfo::builder()
+        //         .allocation_size(size)
+        //         .memory_type_index(idx)
+        //         .build();
+        //     unsafe {
+        //         device.allocate_memory(&info, None)
+        //     }
+        //         .vk("vkAllocateMemory")
+        //         .map(|v| scopeguard::guard(v, |v| unsafe {
+        //             device.free_memory(v, None)
+        //         }))
+        // };
+        // let (mem_idx, ..) = self.find_memory_type(image_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        //     .ok_or(Error::NoMemoryType {
+        //         bits: image_reqs.memory_type_bits,
+        //         flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        //     })?;
+        // let image_mem = allocate_memory(image_reqs.size, mem_idx as _)?;
+        // unsafe {
+        //     device.bind_image_memory(*image, *image_mem, 0)
+        // }.vk("vkBindImageMemory")?;
 
-        let buffer_info = vk::BufferCreateInfo::builder()
-            .flags(vk::BufferCreateFlags::empty())
-            .size(data.len() as _)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe {
-            device.create_buffer(&buffer_info, None)
-        }
-            .vk("vkCreateBuffer")
-            .map(|v| scopeguard::guard(v, |v| unsafe {
-                device.destroy_buffer(v, None);
-            }))?;
-        let buffer_reqs = unsafe {
-            device.get_buffer_memory_requirements(*buffer)
-        };
-        let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let (mem_idx, ..) = self.find_memory_type(buffer_reqs.memory_type_bits, host_flags)
-            .ok_or(Error::NoMemoryType {
-                bits: buffer_reqs.memory_type_bits,
-                flags: host_flags,
-            })?;
-        let buffer_mem = allocate_memory(buffer_reqs.size, mem_idx as _)?;
-        unsafe {
-            device.bind_buffer_memory(*buffer, *buffer_mem, 0)
-        }.vk("vkBindBufferMemory")?;
+        // let buffer_info = vk::BufferCreateInfo::builder()
+        //     .flags(vk::BufferCreateFlags::empty())
+        //     .size(data.len() as _)
+        //     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        //     .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // let buffer = unsafe {
+        //     device.create_buffer(&buffer_info, None)
+        // }
+        //     .vk("vkCreateBuffer")
+        //     .map(|v| scopeguard::guard(v, |v| unsafe {
+        //         device.destroy_buffer(v, None);
+        //     }))?;
+        // let buffer_reqs = unsafe {
+        //     device.get_buffer_memory_requirements(*buffer)
+        // };
+        // let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
+        //     | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // let (mem_idx, ..) = self.find_memory_type(buffer_reqs.memory_type_bits, host_flags)
+        //     .ok_or(Error::NoMemoryType {
+        //         bits: buffer_reqs.memory_type_bits,
+        //         flags: host_flags,
+        //     })?;
+        // let buffer_mem = allocate_memory(buffer_reqs.size, mem_idx as _)?;
+        // unsafe {
+        //     device.bind_buffer_memory(*buffer, *buffer_mem, 0)
+        // }.vk("vkBindBufferMemory")?;
 
-        {
-            let mut mem = device.map_memory_(*buffer_mem, 0, buffer_reqs.size, vk::MemoryMapFlags::empty())
-                .vk("vkMapMemory")?;
-            let copy_size = std::cmp::min(mem.len(), data.len());
-            let mapped_data = &mut mem[..copy_size];
-            mapped_data.copy_from_slice(&data[..copy_size]);
-        }
-        let cmd_buffers = unsafe {
-            let mut command_buffer = [vk::CommandBuffer::null(); 1];
-            let info = vk::CommandBufferAllocateInfo::builder()
-                .command_pool(*self.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(command_buffer.len() as _)
-                .build();
-            match (device.fp_v1_0().allocate_command_buffers)(
-                device.handle(),
-                &info as *const _,
-                command_buffer.as_mut_ptr(),
-            ) {
-                vk::Result::SUCCESS => Ok(()),
-                e => Err(Error::Vk {
-                    context: "vkAllocateCommandBuffers",
-                    result: e,
-                }),
-            }?;
-            scopeguard::guard(command_buffer, |v| {
-                device.free_command_buffers(*self.command_pool, &v);
-            })
-        };
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            device.begin_command_buffer(cmd_buffers[0], &begin_info)
-        }.vk("vkBeginCommandBuffer")?;
+        // {
+        //     let mut mem = device.map_memory_(*buffer_mem, 0, buffer_reqs.size, vk::MemoryMapFlags::empty())
+        //         .vk("vkMapMemory")?;
+        //     let copy_size = std::cmp::min(mem.len(), data.len());
+        //     let mapped_data = &mut mem[..copy_size];
+        //     mapped_data.copy_from_slice(&data[..copy_size]);
+        // }
+        // let cmd_buffers = unsafe {
+        //     let mut command_buffer = [vk::CommandBuffer::null(); 1];
+        //     let info = vk::CommandBufferAllocateInfo::builder()
+        //         .command_pool(*self.command_pool)
+        //         .level(vk::CommandBufferLevel::PRIMARY)
+        //         .command_buffer_count(command_buffer.len() as _)
+        //         .build();
+        //     match (device.fp_v1_0().allocate_command_buffers)(
+        //         device.handle(),
+        //         &info as *const _,
+        //         command_buffer.as_mut_ptr(),
+        //     ) {
+        //         vk::Result::SUCCESS => Ok(()),
+        //         e => Err(Error::Vk {
+        //             context: "vkAllocateCommandBuffers",
+        //             result: e,
+        //         }),
+        //     }?;
+        //     scopeguard::guard(command_buffer, |v| {
+        //         device.free_command_buffers(*self.command_pool, &v);
+        //     })
+        // };
+        // let begin_info = vk::CommandBufferBeginInfo::builder()
+        //     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // unsafe {
+        //     device.begin_command_buffer(cmd_buffers[0], &begin_info)
+        // }.vk("vkBeginCommandBuffer")?;
 
-        let queue_idx = self.queues.graphics.index as u32;
-        let buf_barrier = vk::BufferMemoryBarrier::builder()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .src_queue_family_index(queue_idx)
-            .dst_queue_family_index(queue_idx)
-            .buffer(*buffer)
-            .offset(0)
-            .size(buffer_reqs.size)
-            .build();
-        let mut img_barriers = [
-            vk::ImageMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(queue_idx)
-                .dst_queue_family_index(queue_idx)
-                .image(*image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .build(),
-        ];
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd_buffers[0],
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[], &[buf_barrier], &img_barriers,
-            );
-            device.cmd_copy_buffer_to_image(
-                cmd_buffers[0],
-                *buffer, *image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[
-                    vk::BufferImageCopy {
-                        buffer_offset: 0,
-                        buffer_row_length: 4 * size.w as u32,
-                        buffer_image_height: size.h as _,
-                        image_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                        image_extent: vk::Extent3D {
-                            width: size.w as _,
-                            height: size.h as _,
-                            depth: 1,
-                        },
-                    }
-                ]
-            );
-        }
-        {
-            let img_barrier = &mut img_barriers[0];
-            img_barrier.src_access_mask = img_barrier.dst_access_mask;
-            img_barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
-            img_barrier.old_layout = img_barrier.new_layout;
-            img_barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-        }
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd_buffers[0],
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[], &[], &img_barriers,
-            );
-            device.end_command_buffer(cmd_buffers[0])
-        }.vk("vkEndCommandBuffer")?;
+        // let queue_idx = self.queues.graphics.index as u32;
+        // let buf_barrier = vk::BufferMemoryBarrier::builder()
+        //     .src_access_mask(vk::AccessFlags::empty())
+        //     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        //     .src_queue_family_index(queue_idx)
+        //     .dst_queue_family_index(queue_idx)
+        //     .buffer(*buffer)
+        //     .offset(0)
+        //     .size(buffer_reqs.size)
+        //     .build();
+        // let mut img_barriers = [
+        //     vk::ImageMemoryBarrier::builder()
+        //         .src_access_mask(vk::AccessFlags::empty())
+        //         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        //         .old_layout(vk::ImageLayout::UNDEFINED)
+        //         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        //         .src_queue_family_index(queue_idx)
+        //         .dst_queue_family_index(queue_idx)
+        //         .image(*image)
+        //         .subresource_range(vk::ImageSubresourceRange {
+        //             aspect_mask: vk::ImageAspectFlags::COLOR,
+        //             base_mip_level: 0,
+        //             level_count: 1,
+        //             base_array_layer: 0,
+        //             layer_count: 1,
+        //         })
+        //         .build(),
+        // ];
+        // unsafe {
+        //     device.cmd_pipeline_barrier(
+        //         cmd_buffers[0],
+        //         vk::PipelineStageFlags::TOP_OF_PIPE,
+        //         vk::PipelineStageFlags::TRANSFER,
+        //         vk::DependencyFlags::empty(),
+        //         &[], &[buf_barrier], &img_barriers,
+        //     );
+        //     device.cmd_copy_buffer_to_image(
+        //         cmd_buffers[0],
+        //         *buffer, *image,
+        //         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        //         &[
+        //             vk::BufferImageCopy {
+        //                 buffer_offset: 0,
+        //                 buffer_row_length: 4 * size.w as u32,
+        //                 buffer_image_height: size.h as _,
+        //                 image_subresource: vk::ImageSubresourceLayers {
+        //                     aspect_mask: vk::ImageAspectFlags::COLOR,
+        //                     mip_level: 0,
+        //                     base_array_layer: 0,
+        //                     layer_count: 1,
+        //                 },
+        //                 image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        //                 image_extent: vk::Extent3D {
+        //                     width: size.w as _,
+        //                     height: size.h as _,
+        //                     depth: 1,
+        //                 },
+        //             }
+        //         ]
+        //     );
+        // }
+        // {
+        //     let img_barrier = &mut img_barriers[0];
+        //     img_barrier.src_access_mask = img_barrier.dst_access_mask;
+        //     img_barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+        //     img_barrier.old_layout = img_barrier.new_layout;
+        //     img_barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        // }
+        // unsafe {
+        //     device.cmd_pipeline_barrier(
+        //         cmd_buffers[0],
+        //         vk::PipelineStageFlags::TRANSFER,
+        //         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        //         vk::DependencyFlags::empty(),
+        //         &[], &[], &img_barriers,
+        //     );
+        //     device.end_command_buffer(cmd_buffers[0])
+        // }.vk("vkEndCommandBuffer")?;
 
-        unsafe {
-            let fence_info = vk::FenceCreateInfo::builder()
-                .flags(vk::FenceCreateFlags::empty());
-            let fence = device.create_fence(&fence_info, None)
-                .vk("vkCreateFence")
-                .map(|v| scopeguard::guard(v, |v| {
-                    device.destroy_fence(v, None);
-                }))?;
-            let cmds = [cmd_buffers[0]];
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmds);
-            device.queue_submit(self.queues.graphics.handle, &[submit_info.build()], *fence)
-                .vk("vkQueueSubmit")?;
-            device.wait_for_fences(&[*fence], true, u64::MAX)
-                .vk("vkWaitForFences")?;
-            std::mem::drop(cmd_buffers);
-        }
-        let mut ret = InnerImage {
-            image: ScopeGuard::into_inner(image),
-            memories: [vk::DeviceMemory::null(); MAX_PLANES],
-            buffer: ScopeGuard::into_inner(buffer),
-            dimensions: (size.w as _, size.h as _),
-            format: Format {
-                vk: vk_format,
-                drm: format,
-                modifier: None,
-            },
-            views: RefCell::new(Vec::new()),
-            layout: Cell::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            device: Arc::downgrade(&self.device),
-        };
-        ret.memories[0] = ScopeGuard::into_inner(image_mem);
-        ret.memories[1] = ScopeGuard::into_inner(buffer_mem);
-        Ok(VulkanImage::new(ret))
+        // unsafe {
+        //     let fence_info = vk::FenceCreateInfo::builder()
+        //         .flags(vk::FenceCreateFlags::empty());
+        //     let fence = device.create_fence(&fence_info, None)
+        //         .vk("vkCreateFence")
+        //         .map(|v| scopeguard::guard(v, |v| {
+        //             device.destroy_fence(v, None);
+        //         }))?;
+        //     let cmds = [cmd_buffers[0]];
+        //     let submit_info = vk::SubmitInfo::builder()
+        //         .command_buffers(&cmds);
+        //     device.queue_submit(self.queues.graphics.handle, &[submit_info.build()], *fence)
+        //         .vk("vkQueueSubmit")?;
+        //     device.wait_for_fences(&[*fence], true, u64::MAX)
+        //         .vk("vkWaitForFences")?;
+        //     std::mem::drop(cmd_buffers);
+        // }
+        // let mut ret = InnerImage {
+        //     image: ScopeGuard::into_inner(image),
+        //     memories: [vk::DeviceMemory::null(); MAX_PLANES],
+        //     buffer: ScopeGuard::into_inner(buffer),
+        //     dimensions: (size.w as _, size.h as _),
+        //     format: Format {
+        //         vk: vk_format,
+        //         drm: format,
+        //         modifier: None,
+        //     },
+        //     views: RefCell::new(Vec::new()),
+        //     layout: Cell::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        //     device: Arc::downgrade(&self.device),
+        // };
+        // ret.memories[0] = ScopeGuard::into_inner(image_mem);
+        // ret.memories[1] = ScopeGuard::into_inner(buffer_mem);
+        // Ok(VulkanImage::new(ret))
+        todo!()
     }
 
     fn update_memory(
@@ -1224,11 +1250,49 @@ impl ImportMem for VulkanRenderer {
 impl ImportMemWl for VulkanRenderer {
     fn import_shm_buffer(
         &mut self,
-        _buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
-        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
         todo!()
+        // use crate::backend::allocator::vulkan::format;
+        // use crate::wayland::shm::{
+        //     with_buffer_contents,
+        //     shm_format_to_fourcc,
+        //     BufferData,
+        // };
+        // type CacheMap = HashMap<usize, Arc<InnerImage>>;
+        // with_buffer_contents(buffer, |ptr, len, BufferData { offset, width, height, stride, format: shm_format }| {
+        //     let format = shm_format_to_fourcc(shm_format)
+        //         .ok_or(Error::UnknownShmFormat(shm_format))?;
+        //     let vk_format = format::known_vk_formats()
+        //         .find_map(|(fmt, vk_fmt)| if format == fmt {
+        //             Some(vk_fmt)
+        //         } else {
+        //             None
+        //         })
+        //         .ok_or(Error::UnknownMemoryFormat(format))?;
+        //     if let Some(surface) = surface {
+        //         surface
+        //             .data_map
+        //             .insert_if_missing(|| Rc::new(RefCell::new(CacheMap::new())));
+        //     }
+        //     surface
+        //         .and_then(|surface| {
+        //             surface
+        //                 .data_map
+        //                 .get::<Rc<RefCell<CacheMap>>()
+        //                 .unwrap()
+        //                 .borrow()
+        //                 .get(&self.id())
+        //                 .cloned()
+        //         })
+        //         .filter(|tex| tex.dimensions == (width, height))
+        //         .unwrap_or_else(|| {
+        //         })
+        //     Ok(todo())
+        // })
+        // .map_err(Error::BufferAccess)
     }
 }
 
@@ -1561,14 +1625,8 @@ impl<'a> Frame for VulkanFrame<'a> {
         }
         Ok(())
     }
-    // fn draw_solid(
-    //     &mut self,
-    //     dst: Rectangle<i32, Physical>,
-    //     _damage: &[Rectangle<i32, Physical>],
-    //     color: [f32; 4],
-    // ) -> Result<(), Self::Error> {
-    //     self.clear(color, &[dst])
-    // }
+
+    #[tracing::instrument(skip(self, _damage))]
     fn draw_solid(
         &mut self,
         dst: Rectangle<i32, Physical>,
@@ -1577,22 +1635,25 @@ impl<'a> Frame for VulkanFrame<'a> {
     ) -> Result<(), Self::Error> {
         let (pipe, layout) = self.setup.quad_pipeline();
         self.bind_pipeline(pipe, layout.layout);
+        let data = UniformData {
+            vert: UniformDataVert {
+                transform: MAT4_MODEL_BOX,
+                tex_offset: Vector2::new(0f32, 0f32),
+                tex_extent: Vector2::new(1f32, 1f32),
+            },
+            frag: UniformDataFrag {
+                color,
+            },
+        };
+        trace!(?data.vert.transform, ?data.vert.tex_offset, ?data.vert.tex_extent, "pushing constants");
         unsafe {
-            self.push_constants(&UniformData {
-                vert: UniformDataVert {
-                    transform: Matrix4::one(),
-                    tex_offset: Vector2::new(0f32, 0f32),
-                    tex_extent: Vector2::new(1f32, 1f32),
-                },
-                frag: UniformDataFrag {
-                    color,
-                },
-            });
+            self.push_constants(&data);
             self.rect_viewport(&dst);
             self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
         }
         Ok(())
     }
+    #[tracing::instrument(skip(self, _damage, texture))]
     fn render_texture_from_to(
         &mut self,
         texture: &Self::TextureId,
@@ -1620,28 +1681,29 @@ impl<'a> Frame for VulkanFrame<'a> {
             }
         }
         let (tw, th) = (texture.width(), texture.height());
+        let data = UniformData {
+            vert: UniformDataVert {
+                // transform: src_transform.to_matrix(),
+                transform: MAT4_MODEL_BOX,
+                tex_offset: Vector2::new(
+                    (src.loc.x / (tw as f64)) as f32,
+                    (src.loc.y / (th as f64)) as f32,
+                ),
+                tex_extent: Vector2::new(
+                    (src.size.w / (tw as f64)) as f32,
+                    (src.size.h / (th as f64)) as f32,
+                ),
+            },
+            frag: UniformDataFrag {
+                alpha,
+            },
+        };
+        trace!(?data.vert.transform, ?data.vert.tex_offset, ?data.vert.tex_extent, "pushing constants");
         unsafe {
-            self.push_constants(&UniformData {
-                vert: UniformDataVert {
-                    transform: src_transform.to_matrix(),
-                    tex_offset: Vector2::new(
-                        (src.loc.x / (tw as f64)) as f32,
-                        (src.loc.y / (th as f64)) as f32,
-                    ),
-                    tex_extent: Vector2::new(
-                        (src.size.w / (tw as f64)) as f32,
-                        (src.size.h / (th as f64)) as f32,
-                    ),
-                },
-                frag: UniformDataFrag {
-                    alpha,
-                },
-            });
+            self.push_constants(&data);
             self.rect_viewport(&dst);
             self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
         }
-        // todo!()
-        mocked!();
         Ok(())
     }
     fn transformation(&self) -> Transform {
@@ -1866,7 +1928,7 @@ impl InnerImageView {
 struct InnerImage {
     image: vk::Image,
     memories: [vk::DeviceMemory; MAX_PLANES],
-    buffer: vk::Buffer,
+    buffer: Option<StagingBuffer>,
     dimensions: (u32, u32),
     format: Format,
     views: RefCell<Vec<(vk::DescriptorSetLayout, InnerImageView)>>,
@@ -1936,9 +1998,6 @@ impl Drop for InnerImage {
                 view.destroy(&device);
             }
             device.destroy_image(self.image, None);
-            if self.buffer != vk::Buffer::null() {
-                device.destroy_buffer(self.buffer, None);
-            }
             for &mem in self.memories() {
                 device.free_memory(mem, None);
             }
@@ -2159,6 +2218,8 @@ pub enum Error<'a> {
     /// Occurs when [`ImportMem`] is called with an unsupported format
     #[error("unsupported memory import format: {0:?}")]
     UnknownMemoryFormat(Fourcc),
+    #[error("unsupported wl_shm format: {0:?}")]
+    UnknownShmFormat(wl_shm::Format),
     #[error("no device memory type with bits: {bits:b} and flags {flags:?}")]
     NoMemoryType {
         bits: u32,
@@ -2181,6 +2242,8 @@ pub enum Error<'a> {
     RendererSetup(vk::Format),
     #[error("waiting for fence interrupted: {0}")]
     Interrupted(#[from] crate::backend::renderer::sync::Interrupted),
+    #[error(transparent)]
+    BufferAccess(#[from] crate::wayland::shm::BufferAccessError),
 }
 
 impl<'a> Error<'a> {

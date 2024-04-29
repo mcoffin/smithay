@@ -1,6 +1,6 @@
 #version 450
 
-layout(push_constant, row_major) uniform UBO {
+layout(push_constant) uniform UBO {
 	mat4 transform;
 	vec2 tex_offset;
 	vec2 tex_extent;
