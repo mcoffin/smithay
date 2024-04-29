@@ -405,9 +405,15 @@ impl InputBackend for WinitInput {
     type SpecialEvent = UnusedEvent;
 }
 
+/// Represents the style of button mappings presented by the platform currently in use
+///
+/// This is necessary because for the `Xorg` case, we have to handle tertiary mouse button mappings
+/// separately from in other cases
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputPlatform {
+    /// X11
     Xorg,
+    /// `libinput`-based platforms
     Libinput,
 }
 

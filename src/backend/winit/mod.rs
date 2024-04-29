@@ -19,7 +19,6 @@
 //! two traits for the winit backend.
 
 use std::io::Error as IoError;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -310,16 +309,6 @@ pub enum Error {
     #[doc = "Renderer initialization failed (vulkan)"]
     #[error("Vulkan Renderer creation falied: {0}")]
     Vulkan(#[from] vulkan::Error),
-}
-
-impl Error {
-    #[inline(always)]
-    fn surface<E>(e: E) -> Self
-    where
-        E: Into<Box<dyn std::error::Error>>,
-    {
-        Error::Surface(e.into())
-    }
 }
 
 /// Window, created by `winit` with access to an active graphics context (represented by an

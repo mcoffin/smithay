@@ -78,8 +78,14 @@ impl Swapchain {
                 swap_img.destroy(&device);
             }
         });
-        for (idx, img) in images.into_iter().enumerate() {
-            let swap_image = SwapchainImage::new(r.device(), img, idx, format, render_setup.render_pass(), &extent)?;
+        for img in images.into_iter() {
+            let swap_image = SwapchainImage::new(
+                r.device(),
+                img,
+                format,
+                render_setup.render_pass(),
+                &extent
+            )?;
             swap_images.push(swap_image);
         }
         let pool_info = vk::CommandPoolCreateInfo {
@@ -319,9 +325,6 @@ impl SupportDetails {
             present_modes,
         })
     }
-    pub fn valid(&self) -> bool {
-        !self.formats.is_empty() && !self.present_modes.is_empty()
-    }
     pub fn choose_format(&self) -> Option<vk::SurfaceFormatKHR> {
         const SUPPORTED_FORMATS: &[vk::Format] = &[
             vk::Format::B8G8R8A8_SRGB,
@@ -386,7 +389,6 @@ pub struct SwapchainImage {
     pub framebuffer: vk::Framebuffer,
     pub image_ready_semaphore: vk::Semaphore,
     pub submit_semaphore: vk::Semaphore,
-    pub index: usize,
     pub transitioned: AtomicBool,
 }
 
@@ -394,7 +396,6 @@ impl SwapchainImage {
     fn new(
         device: &ash::Device,
         image: vk::Image,
-        index: usize,
         format: vk::Format,
         render_pass: vk::RenderPass,
         extent: &vk::Extent2D,
@@ -462,7 +463,6 @@ impl SwapchainImage {
             image_ready_semaphore: ScopeGuard::into_inner(image_ready_sem),
             submit_semaphore: ScopeGuard::into_inner(submit_sem),
             transitioned: AtomicBool::new(false),
-            index,
         })
     }
     #[inline]

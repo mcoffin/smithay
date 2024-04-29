@@ -1,3 +1,7 @@
+//! Implementation of the rendering traits using Vulkan 1.1+
+//!
+//! Good entry points are [`VulkanRenderer`] and [`VulkanFrame`]
+
 use self::buffer::StagingBuffer;
 
 use super::{ImportDma, ImportDmaWl, ImportMem, ImportMemWl};
@@ -18,6 +22,11 @@ use crate::{
     contextual_handles, fn_name,
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     vulkan_handles,
+    wayland::compositor,
+    wayland::shm::{
+        with_buffer_contents,
+        BufferData,
+    },
 };
 use ash::{
     extensions::{ext::ImageDrmFormatModifier, khr::ExternalMemoryFd},
@@ -25,7 +34,6 @@ use ash::{
     vk,
 };
 use cgmath::{
-    prelude::*,
     Matrix4,
     Vector2,
 };
@@ -35,10 +43,13 @@ use std::{
     borrow::Cow, cell::{
         Cell,
         RefCell,
-    }, collections::{
+    },
+    collections::{
         HashMap,
         LinkedList,
-    }, fmt, mem, num::NonZeroU64, ops::{Deref, DerefMut}, os::fd::{AsRawFd, IntoRawFd}, rc::Rc, sync::{
+        linked_list,
+    },
+    fmt, mem, num::NonZeroU64, ops::{Deref, DerefMut}, os::fd::{AsRawFd, IntoRawFd}, rc::Rc, sync::{
         atomic::Ordering, mpsc, Arc, Weak
     }
 };
@@ -47,15 +58,18 @@ use std::{
 use tracing::{debug, error, trace, warn};
 
 mod buffer;
-mod command_pool;
 mod dmabuf;
 mod fence;
+mod format;
 mod memory;
+mod queue;
 mod render_pass;
 mod shaders;
 mod swapchain;
 mod transform;
 mod util;
+mod view;
+
 use util::*;
 use fence::*;
 use swapchain::Swapchain;
@@ -65,8 +79,15 @@ use render_pass::{
     UniformDataVert,
     UniformDataFrag,
 };
-use memory::DeviceExtMemory;
-use transform::TransformExt;
+use queue::{
+    QueueFamilies,
+    Queue,
+};
+use format::{
+    Format,
+    FormatInfo,
+};
+use view::InnerImageView;
 
 /// [`Renderer`] implementation using the [`vulkan`](https://www.vulkan.org/) graphics API
 #[derive(Debug)]
@@ -90,13 +111,6 @@ pub struct VulkanRenderer {
     submitted_frames: (mpsc::Sender<SubmittedFrame>, mpsc::Receiver<SubmittedFrame>),
     pending_frames: LinkedList<SubmittedFrame>,
 }
-
-const MAT4_MODEL_BOX: Matrix4::<f32> = Matrix4::new(
-    2.0, 0.0, 0.0, 0.0,
-    0.0, 2.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    -1.0, -1.0, 0.0, 1.0
-);
 
 impl VulkanRenderer {
     /// Creates a new [`VulkanRenderer`] from this [`PhysicalDevice`]. The renderer is initially
@@ -286,48 +300,43 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    fn cleanup<F>(&mut self, mut cb: F) -> Result<(), Error<'static>>
-    where
-        F: FnMut(SubmittedFrame) -> bool,
-    {
-        self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
-        self.shm_images.retain(|img| img.upgrade().is_some());
-
-        // flush pending frames into list
-        let mut cb_enabled = true;
-        let (_, rx) = &self.submitted_frames;
-        while let Ok(v) = rx.try_recv() {
-            if !v.is_done() || !cb_enabled {
-                self.pending_frames.push_back(v);
-            } else {
-                cb_enabled = !cb(v);
-            }
-        }
-        if cb_enabled {
-            self.clean_pending_frames(cb)
+    /// Receives all [`SubmittedFrames`] that are pending on the receiver.
+    ///
+    /// the iterator will return all [`SubmittedFrame`]s that are *done*, but put the others into
+    /// `pending_frames`
+    fn receive_pending(&mut self) -> impl Iterator<Item=SubmittedFrame> + '_ {
+        let (_, rx) = &mut self.submitted_frames;
+        rx.try_iter().filter_map(|v| if v.is_done() {
+            Some(v)
         } else {
-            self.clean_pending_frames(|_| false);
-        }
-        Ok(())
+            self.pending_frames.push_back(v);
+            None
+        })
     }
 
-    fn clean_pending_frames<F>(&mut self, mut cb: F)
-    where
-        F: FnMut(SubmittedFrame) -> bool,
-    {
-        if self.pending_frames.is_empty() {
-            return;
+    fn cleanup_pending_threshold(&mut self, cleanup_threshold: usize) -> Option<SubmittedFrame> {
+        trait CheckPendingExt {
+            fn check_pending(&mut self) -> CheckPending<'_>;
         }
-        let mut cursor = self.pending_frames.cursor_front_mut();
-        while cursor.current().is_some() {
-            if cursor.current().filter(|f| f.is_done()).is_some() {
-                if cb(cursor.remove_current().unwrap()) {
-                    return;
-                }
-            } else {
-                cursor.move_next();
+        impl CheckPendingExt for VulkanRenderer {
+            #[inline(always)]
+            fn check_pending(&mut self) -> CheckPending<'_> {
+                CheckPending(self.pending_frames.cursor_front_mut())
             }
         }
+        let received = self.receive_pending().last();
+        let found_finished = if self.pending_frames.len() > cleanup_threshold {
+            self.check_pending().last()
+        } else {
+            self.check_pending().next()
+        };
+        found_finished.or(received)
+    }
+
+    fn cleanup(&mut self) -> Option<SubmittedFrame> {
+        self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
+        self.shm_images.retain(|img| img.upgrade().is_some());
+        self.cleanup_pending_threshold(5)
     }
 
     fn collect_pending(&mut self) -> impl Iterator<Item=SubmittedFrame> + '_ {
@@ -386,7 +395,33 @@ impl VulkanRenderer {
     }
 }
 
+/// [`Iterator`] implementation for iterating over [`VulkanRenderer::pending_frames`]
+#[repr(transparent)]
+struct CheckPending<'a>(linked_list::CursorMut<'a, SubmittedFrame>);
+
+impl<'a> Iterator for CheckPending<'a> {
+    type Item = SubmittedFrame;
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.0.current().is_some() {
+            if self.0.current().filter(|v| v.is_done()).is_some() {
+                return self.0.remove_current();
+            } else {
+                self.0.move_next();
+            }
+        }
+        None
+    }
+}
+
+#[doc(hidden)]
+#[macro_export]
 macro_rules! vk_call {
+    ($dev:expr, $fn_name:ident ($($arg:expr),+ $(,)?)) => {
+        unsafe {
+            $dev.$fn_name($($arg),+)
+                .vk(concat!("vk_", stringify!($create_fn)))
+        }
+    };
     ($e:expr, $fname:expr) => {
         unsafe { $e }.vk($fname)
     };
@@ -449,11 +484,11 @@ impl Renderer for VulkanRenderer {
         _dst_transform: Transform,
     ) -> Result<Self::Frame<'_>, Self::Error> {
         use std::mem::MaybeUninit;
-        let mut prev = None;
-        self.cleanup(|f| {
-            prev = Some(f);
-            true
-        })?;
+        let mut prev = self.cleanup();
+        // self.cleanup(|f| {
+        //     prev = Some(f);
+        //     true
+        // })?;
         let target = self.target.as_ref().ok_or(Error::NoTarget)?;
         let new_command_buffer = || unsafe {
             let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
@@ -624,7 +659,6 @@ impl Renderer for VulkanRenderer {
             submit_fence,
             output_size,
             bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
-            submitted_rx: self.submitted_frames.0.clone(),
         };
         let cb = ret.command_buffer;
         let begin_info = vk::RenderPassBeginInfo::builder()
@@ -991,245 +1025,11 @@ fn mem_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
 impl ImportMem for VulkanRenderer {
     fn import_memory(
         &mut self,
-        data: &[u8],
-        format: Fourcc,
-        size: Size<i32, BufferCoord>,
+        _data: &[u8],
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
         _flipped: bool,
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        // let vk_format = mem_formats()
-        //     .find_map(|(fmt, vk_fmt)| if fmt == format {
-        //         Some(vk_fmt)
-        //     } else {
-        //         None
-        //     })
-        //     .ok_or(Error::UnknownMemoryFormat(format))?;
-        // let device = self.device();
-        // let queue_indices = [self.queues.graphics.index as u32];
-        // let create_info = vk::ImageCreateInfo::builder()
-        //     .flags(vk::ImageCreateFlags::empty())
-        //     .image_type(vk::ImageType::TYPE_2D)
-        //     .format(vk_format)
-        //     .extent(vk::Extent3D {
-        //         width: size.w as _,
-        //         height: size.h as _,
-        //         depth: 1,
-        //     })
-        //     .mip_levels(1)
-        //     .array_layers(1)
-        //     .samples(vk::SampleCountFlags::TYPE_1)
-        //     .tiling(vk::ImageTiling::OPTIMAL)
-        //     .usage(imported_usage_flags())
-        //     .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        //     .initial_layout(vk::ImageLayout::UNDEFINED)
-        //     .queue_family_indices(&queue_indices);
-        // let image = unsafe {
-        //     device.create_image(&create_info, None)
-        // }
-        //     .vk("vkCreateImage")
-        //     .map(|v| scopeguard::guard(v, |v| unsafe {
-        //         device.destroy_image(v, None);
-        //     }))?;
-        // let image_reqs = unsafe {
-        //     device.get_image_memory_requirements(*image)
-        // };
-        // let allocate_memory = |size: vk::DeviceSize, idx: u32| {
-        //     let info = vk::MemoryAllocateInfo::builder()
-        //         .allocation_size(size)
-        //         .memory_type_index(idx)
-        //         .build();
-        //     unsafe {
-        //         device.allocate_memory(&info, None)
-        //     }
-        //         .vk("vkAllocateMemory")
-        //         .map(|v| scopeguard::guard(v, |v| unsafe {
-        //             device.free_memory(v, None)
-        //         }))
-        // };
-        // let (mem_idx, ..) = self.find_memory_type(image_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        //     .ok_or(Error::NoMemoryType {
-        //         bits: image_reqs.memory_type_bits,
-        //         flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        //     })?;
-        // let image_mem = allocate_memory(image_reqs.size, mem_idx as _)?;
-        // unsafe {
-        //     device.bind_image_memory(*image, *image_mem, 0)
-        // }.vk("vkBindImageMemory")?;
-
-        // let buffer_info = vk::BufferCreateInfo::builder()
-        //     .flags(vk::BufferCreateFlags::empty())
-        //     .size(data.len() as _)
-        //     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        //     .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // let buffer = unsafe {
-        //     device.create_buffer(&buffer_info, None)
-        // }
-        //     .vk("vkCreateBuffer")
-        //     .map(|v| scopeguard::guard(v, |v| unsafe {
-        //         device.destroy_buffer(v, None);
-        //     }))?;
-        // let buffer_reqs = unsafe {
-        //     device.get_buffer_memory_requirements(*buffer)
-        // };
-        // let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
-        //     | vk::MemoryPropertyFlags::HOST_COHERENT;
-        // let (mem_idx, ..) = self.find_memory_type(buffer_reqs.memory_type_bits, host_flags)
-        //     .ok_or(Error::NoMemoryType {
-        //         bits: buffer_reqs.memory_type_bits,
-        //         flags: host_flags,
-        //     })?;
-        // let buffer_mem = allocate_memory(buffer_reqs.size, mem_idx as _)?;
-        // unsafe {
-        //     device.bind_buffer_memory(*buffer, *buffer_mem, 0)
-        // }.vk("vkBindBufferMemory")?;
-
-        // {
-        //     let mut mem = device.map_memory_(*buffer_mem, 0, buffer_reqs.size, vk::MemoryMapFlags::empty())
-        //         .vk("vkMapMemory")?;
-        //     let copy_size = std::cmp::min(mem.len(), data.len());
-        //     let mapped_data = &mut mem[..copy_size];
-        //     mapped_data.copy_from_slice(&data[..copy_size]);
-        // }
-        // let cmd_buffers = unsafe {
-        //     let mut command_buffer = [vk::CommandBuffer::null(); 1];
-        //     let info = vk::CommandBufferAllocateInfo::builder()
-        //         .command_pool(*self.command_pool)
-        //         .level(vk::CommandBufferLevel::PRIMARY)
-        //         .command_buffer_count(command_buffer.len() as _)
-        //         .build();
-        //     match (device.fp_v1_0().allocate_command_buffers)(
-        //         device.handle(),
-        //         &info as *const _,
-        //         command_buffer.as_mut_ptr(),
-        //     ) {
-        //         vk::Result::SUCCESS => Ok(()),
-        //         e => Err(Error::Vk {
-        //             context: "vkAllocateCommandBuffers",
-        //             result: e,
-        //         }),
-        //     }?;
-        //     scopeguard::guard(command_buffer, |v| {
-        //         device.free_command_buffers(*self.command_pool, &v);
-        //     })
-        // };
-        // let begin_info = vk::CommandBufferBeginInfo::builder()
-        //     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // unsafe {
-        //     device.begin_command_buffer(cmd_buffers[0], &begin_info)
-        // }.vk("vkBeginCommandBuffer")?;
-
-        // let queue_idx = self.queues.graphics.index as u32;
-        // let buf_barrier = vk::BufferMemoryBarrier::builder()
-        //     .src_access_mask(vk::AccessFlags::empty())
-        //     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-        //     .src_queue_family_index(queue_idx)
-        //     .dst_queue_family_index(queue_idx)
-        //     .buffer(*buffer)
-        //     .offset(0)
-        //     .size(buffer_reqs.size)
-        //     .build();
-        // let mut img_barriers = [
-        //     vk::ImageMemoryBarrier::builder()
-        //         .src_access_mask(vk::AccessFlags::empty())
-        //         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        //         .old_layout(vk::ImageLayout::UNDEFINED)
-        //         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        //         .src_queue_family_index(queue_idx)
-        //         .dst_queue_family_index(queue_idx)
-        //         .image(*image)
-        //         .subresource_range(vk::ImageSubresourceRange {
-        //             aspect_mask: vk::ImageAspectFlags::COLOR,
-        //             base_mip_level: 0,
-        //             level_count: 1,
-        //             base_array_layer: 0,
-        //             layer_count: 1,
-        //         })
-        //         .build(),
-        // ];
-        // unsafe {
-        //     device.cmd_pipeline_barrier(
-        //         cmd_buffers[0],
-        //         vk::PipelineStageFlags::TOP_OF_PIPE,
-        //         vk::PipelineStageFlags::TRANSFER,
-        //         vk::DependencyFlags::empty(),
-        //         &[], &[buf_barrier], &img_barriers,
-        //     );
-        //     device.cmd_copy_buffer_to_image(
-        //         cmd_buffers[0],
-        //         *buffer, *image,
-        //         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        //         &[
-        //             vk::BufferImageCopy {
-        //                 buffer_offset: 0,
-        //                 buffer_row_length: 4 * size.w as u32,
-        //                 buffer_image_height: size.h as _,
-        //                 image_subresource: vk::ImageSubresourceLayers {
-        //                     aspect_mask: vk::ImageAspectFlags::COLOR,
-        //                     mip_level: 0,
-        //                     base_array_layer: 0,
-        //                     layer_count: 1,
-        //                 },
-        //                 image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        //                 image_extent: vk::Extent3D {
-        //                     width: size.w as _,
-        //                     height: size.h as _,
-        //                     depth: 1,
-        //                 },
-        //             }
-        //         ]
-        //     );
-        // }
-        // {
-        //     let img_barrier = &mut img_barriers[0];
-        //     img_barrier.src_access_mask = img_barrier.dst_access_mask;
-        //     img_barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
-        //     img_barrier.old_layout = img_barrier.new_layout;
-        //     img_barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-        // }
-        // unsafe {
-        //     device.cmd_pipeline_barrier(
-        //         cmd_buffers[0],
-        //         vk::PipelineStageFlags::TRANSFER,
-        //         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-        //         vk::DependencyFlags::empty(),
-        //         &[], &[], &img_barriers,
-        //     );
-        //     device.end_command_buffer(cmd_buffers[0])
-        // }.vk("vkEndCommandBuffer")?;
-
-        // unsafe {
-        //     let fence_info = vk::FenceCreateInfo::builder()
-        //         .flags(vk::FenceCreateFlags::empty());
-        //     let fence = device.create_fence(&fence_info, None)
-        //         .vk("vkCreateFence")
-        //         .map(|v| scopeguard::guard(v, |v| {
-        //             device.destroy_fence(v, None);
-        //         }))?;
-        //     let cmds = [cmd_buffers[0]];
-        //     let submit_info = vk::SubmitInfo::builder()
-        //         .command_buffers(&cmds);
-        //     device.queue_submit(self.queues.graphics.handle, &[submit_info.build()], *fence)
-        //         .vk("vkQueueSubmit")?;
-        //     device.wait_for_fences(&[*fence], true, u64::MAX)
-        //         .vk("vkWaitForFences")?;
-        //     std::mem::drop(cmd_buffers);
-        // }
-        // let mut ret = InnerImage {
-        //     image: ScopeGuard::into_inner(image),
-        //     memories: [vk::DeviceMemory::null(); MAX_PLANES],
-        //     buffer: ScopeGuard::into_inner(buffer),
-        //     dimensions: (size.w as _, size.h as _),
-        //     format: Format {
-        //         vk: vk_format,
-        //         drm: format,
-        //         modifier: None,
-        //     },
-        //     views: RefCell::new(Vec::new()),
-        //     layout: Cell::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-        //     device: Arc::downgrade(&self.device),
-        // };
-        // ret.memories[0] = ScopeGuard::into_inner(image_mem);
-        // ret.memories[1] = ScopeGuard::into_inner(buffer_mem);
-        // Ok(VulkanImage::new(ret))
         todo!()
     }
 
@@ -1247,52 +1047,134 @@ impl ImportMem for VulkanRenderer {
     }
 }
 
+type ShmCache = HashMap<usize, Arc<InnerImage>>;
+
+/// Helper trait for [`ImportMemWl`] `impl` for [`VulkanRenderer`]
+trait SurfaceExtVulkan {
+    fn cached_image<R: Renderer>(&self, r: &R, data: &BufferData) -> Option<Arc<InnerImage>>;
+}
+
+impl SurfaceExtVulkan for compositor::SurfaceData {
+    fn cached_image<R: Renderer>(&self, r: &R, data: &BufferData) -> Option<Arc<InnerImage>> {
+        let &BufferData { width, height, .. } = data;
+        self
+            .data_map
+            .insert_if_missing(|| Rc::new(RefCell::new(ShmCache::new())));
+        self
+            .data_map
+            .get::<Rc<RefCell<ShmCache>>>()
+            .unwrap()
+            .borrow()
+            .get(&r.id())
+            .cloned()
+            .filter(|tex| tex.dimensions == (width as _, height as _))
+    }
+}
+
 impl ImportMemWl for VulkanRenderer {
     fn import_shm_buffer(
         &mut self,
         buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
-        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        surface: Option<&compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        todo!()
-        // use crate::backend::allocator::vulkan::format;
-        // use crate::wayland::shm::{
-        //     with_buffer_contents,
-        //     shm_format_to_fourcc,
-        //     BufferData,
-        // };
-        // type CacheMap = HashMap<usize, Arc<InnerImage>>;
-        // with_buffer_contents(buffer, |ptr, len, BufferData { offset, width, height, stride, format: shm_format }| {
-        //     let format = shm_format_to_fourcc(shm_format)
-        //         .ok_or(Error::UnknownShmFormat(shm_format))?;
-        //     let vk_format = format::known_vk_formats()
-        //         .find_map(|(fmt, vk_fmt)| if format == fmt {
-        //             Some(vk_fmt)
-        //         } else {
-        //             None
-        //         })
-        //         .ok_or(Error::UnknownMemoryFormat(format))?;
-        //     if let Some(surface) = surface {
-        //         surface
-        //             .data_map
-        //             .insert_if_missing(|| Rc::new(RefCell::new(CacheMap::new())));
-        //     }
-        //     surface
-        //         .and_then(|surface| {
-        //             surface
-        //                 .data_map
-        //                 .get::<Rc<RefCell<CacheMap>>()
-        //                 .unwrap()
-        //                 .borrow()
-        //                 .get(&self.id())
-        //                 .cloned()
-        //         })
-        //         .filter(|tex| tex.dimensions == (width, height))
-        //         .unwrap_or_else(|| {
-        //         })
-        //     Ok(todo())
-        // })
-        // .map_err(Error::BufferAccess)
+        with_buffer_contents(buffer, |ptr, len, data| -> Result<_, <Self as Renderer>::Error> {
+            let BufferData { offset, width, height, format: shm_format, .. } = data;
+
+            // try cache first
+            let image = if let Some(cached) = surface.and_then(|v| v.cached_image(&*self, &data)) {
+                cached.clone()
+            } else {
+                // otherwise create a new image
+                let device = self.device();
+                let fmt = Format::try_from(shm_format)?;
+                let queue_family_indices = &[self.queues.graphics.index as u32];
+                let info = vk::ImageCreateInfo::builder()
+                    .flags(vk::ImageCreateFlags::empty())
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(fmt.vk)
+                    .extent(vk::Extent3D {
+                        width: width as _,
+                        height: height as _,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(imported_usage_flags())
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .queue_family_indices(queue_family_indices)
+                    .initial_layout(vk::ImageLayout::UNDEFINED);
+                let image = vk_create_guarded!(device, create_image(&info, None), destroy_image(None))?;
+                let reqs = unsafe { device.get_image_memory_requirements(*image) };
+                let (mem_idx, ..) = [
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::empty(),
+                ].into_iter().find_map(|props| {
+                    self.find_memory_type(reqs.memory_type_bits, props)
+                }).ok_or(Error::NoMemoryType {
+                    bits: reqs.memory_type_bits,
+                    flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                })?;
+                let info = vk::MemoryAllocateInfo::builder()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(mem_idx as _)
+                    .build();
+                let memory = vk_create_guarded!(device, allocate_memory(&info, None), free_memory(None))?;
+                vk_call!(device, bind_image_memory(*image, *memory, 0))?;
+                let buffer = StagingBuffer::new(self, len as vk::DeviceSize, vk::SharingMode::EXCLUSIVE)?;
+                Arc::new(InnerImage {
+                    image: ScopeGuard::into_inner(image),
+                    memories: [vk::DeviceMemory::null(); MAX_PLANES],
+                    buffer: Some(buffer),
+                    dimensions: (width as _, height as _),
+                    format: fmt,
+                    views: RefCell::new(Vec::new()),
+                    layout: Cell::new(vk::ImageLayout::UNDEFINED),
+                    device: Arc::downgrade(&self.device),
+                })
+            };
+
+            let b_data = unsafe {
+                std::slice::from_raw_parts(ptr.offset(offset as isize), len)
+            };
+            let buffer = image.buffer.as_ref()
+                .expect("shm image must have a buffer");
+            buffer.upload(b_data, offset as vk::DeviceSize)?;
+
+            let cb = self.device.create_single_command_buffer(
+                *self.command_pool,
+                vk::CommandBufferLevel::PRIMARY,
+            ).map(|v| scopeguard::guard(v, |v| unsafe {
+                self.device.free_command_buffers(*self.command_pool, &[v]);
+            }))?;
+            let (w, h) = image.dimensions;
+            buffer::record_copy_buffer_image(
+                self.device(),
+                &self.queues.graphics,
+                *cb, buffer.handle(),
+                &image, [w, h], 0
+            )?;
+            let info = vk::FenceCreateInfo::builder()
+                .flags(vk::FenceCreateFlags::empty());
+            let fence = vk_create_guarded!(self.device(), create_fence(&info, None), destroy_fence(None))?;
+            let cbs = &[*cb];
+            let submit_info = vk::SubmitInfo::builder()
+                .wait_semaphores(&[])
+                .wait_dst_stage_mask(&[])
+                .command_buffers(cbs)
+                .signal_semaphores(&[]);
+
+            // TODO: make it so we don't have to block here by using semaphores
+            //
+            // or maybe moving these commands into the render submission?
+            vk_call!(self.device(), queue_submit(self.queues.graphics.handle, &[submit_info.build()], *fence))?;
+            image.layout.set(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            vk_call!(self.device(), wait_for_fences(&[*fence], true, u64::MAX))?;
+
+            Ok(VulkanImage(image))
+        }).map_err(Error::BufferAccess)?
     }
 }
 
@@ -1368,11 +1250,6 @@ impl SubmittedFrame {
             fence,
             device: frame.renderer.device.clone(),
         }
-    }
-
-    #[inline(always)]
-    fn command_buffer_valid(&self) -> bool {
-        !self.command_buffer.is_null() && !self.command_pool.is_null()
     }
 
     #[inline(always)]
@@ -1455,7 +1332,6 @@ pub struct VulkanFrame<'a> {
     submit_fence: vk::Fence,
     output_size: Size<i32, Physical>,
     bound_pipeline: (vk::Pipeline, vk::PipelineLayout),
-    submitted_rx: mpsc::Sender<SubmittedFrame>,
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
@@ -1563,6 +1439,16 @@ impl<'a> VulkanFrame<'a> {
         );
     }
 }
+
+/// Matrix that equates to 2D scale by 2.0, and translate by (-1.0, -1.0)
+///
+/// translates 0-based coordinates to 0-centered coordinates for rectangle ops
+const MAT4_MODEL_BOX: Matrix4::<f32> = Matrix4::new(
+    2.0, 0.0, 0.0, 0.0,
+    0.0, 2.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    -1.0, -1.0, 0.0, 1.0
+);
 
 impl<'a> Frame for VulkanFrame<'a> {
     type Error = <VulkanRenderer as Renderer>::Error;
@@ -1675,7 +1561,7 @@ impl<'a> Frame for VulkanFrame<'a> {
                     vk::PipelineBindPoint::GRAPHICS,
                     layout.layout,
                     0,
-                    &view.descriptor_sets[idx..(idx+1)],
+                    &view.descriptor_sets()[idx..(idx+1)],
                     &[]
                 );
             }
@@ -1787,13 +1673,6 @@ impl<'a> Frame for VulkanFrame<'a> {
     }
 }
 
-#[derive(Debug)]
-struct Format {
-    vk: vk::Format,
-    drm: Fourcc,
-    modifier: Option<vk::DrmFormatModifierPropertiesEXT>,
-}
-
 /// [`Texture`] implementation for a [`VulkanRenderer`]
 #[derive(Debug, Clone)]
 #[repr(transparent)]
@@ -1822,105 +1701,6 @@ impl Texture for VulkanImage {
     }
     fn format(&self) -> Option<Fourcc> {
         Some(self.0.format.drm)
-    }
-}
-
-#[derive(Debug)]
-struct InnerImageView {
-    image_view: vk::ImageView,
-    ds_pool: vk::DescriptorPool,
-    descriptor_sets: Vec<vk::DescriptorSet>,
-}
-
-impl InnerImageView {
-    fn new(image: &InnerImage, layout: &render_pass::PipelineLayout, max: u32) -> Result<Self, Error<'static>> {
-        let device = image.device.upgrade().unwrap();
-        let info = vk::ImageViewCreateInfo::builder()
-            .image(image.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(image.format.vk)
-            .components(vk::ComponentMapping {
-                r: vk::ComponentSwizzle::IDENTITY,
-                g: vk::ComponentSwizzle::IDENTITY,
-                b: vk::ComponentSwizzle::IDENTITY,
-                a: if image.has_alpha() {
-                    vk::ComponentSwizzle::IDENTITY
-                } else {
-                    vk::ComponentSwizzle::ONE
-                },
-            })
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        let mut ret = unsafe {
-            device.create_image_view(&info, None)
-                .vk("vkCreateImageView")
-        }.map(|image_view| InnerImageView {
-            image_view,
-            ds_pool: vk::DescriptorPool::null(),
-            descriptor_sets: Vec::new(),
-        }).map(|v| scopeguard::guard(v, |mut v| unsafe {
-            v.destroy(&device);
-        }))?;
-
-        let pool_sizes = &[
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: max,
-            },
-        ];
-        let info = vk::DescriptorPoolCreateInfo::builder()
-            .max_sets(max)
-            .pool_sizes(pool_sizes);
-        ret.ds_pool = unsafe {
-            device.create_descriptor_pool(&info, None)
-        }.vk("vkCreateDescriptorPool")?;
-
-        let ds_layouts = vec![layout.ds_layout; max as usize];
-        let info = vk::DescriptorSetAllocateInfo::builder()
-            .descriptor_pool(ret.ds_pool)
-            .set_layouts(ds_layouts.as_slice());
-        ret.descriptor_sets = unsafe {
-            device.allocate_descriptor_sets(&info)
-        }.vk("vkAllocateDescriptorSets")?;
-        debug_assert_eq!(ret.descriptor_sets.len(), max as usize);
-
-        let image_info = [
-            vk::DescriptorImageInfo {
-                sampler: layout.sampler,
-                image_view: ret.image_view,
-                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            },
-        ];
-        let mut writes = Vec::with_capacity(ret.descriptor_sets.len());
-        let it = ret.descriptor_sets.iter()
-            .map(|&ds| {
-                vk::WriteDescriptorSet::builder()
-                    .dst_set(ds)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&image_info)
-                    .build()
-            });
-        writes.extend(it);
-        unsafe {
-            device.update_descriptor_sets(writes.as_slice(), &[]);
-        }
-
-        Ok(ScopeGuard::into_inner(ret))
-    }
-    unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.image_view != vk::ImageView::null() {
-            device.destroy_image_view(self.image_view, None);
-        }
-        if self.ds_pool != vk::DescriptorPool::null() {
-            device.destroy_descriptor_pool(self.ds_pool, None);
-        }
     }
 }
 
@@ -1960,6 +1740,11 @@ impl InnerImage {
         self.format.vk.has_alpha()
     }
 
+    /// TODO: honestly we *probably* know when this is going to happen, so wouldn't have to key off
+    /// of it and have mutable state within [`InnerImage`].
+    ///
+    /// Fixing this would also avoid the dynamic allocation of the [`Vec`] for the
+    /// [`InnerImageView`]s
     fn get_or_create_view(&self, layout: &render_pass::PipelineLayout) -> Result<impl Deref<Target=InnerImageView> + '_, Error<'static>> {
         use std::cell::Ref;
         debug_assert_ne!(layout.ds_layout, vk::DescriptorSetLayout::null());
@@ -1993,6 +1778,12 @@ impl Drop for InnerImage {
             return;
         };
         unsafe {
+            // if !self.command_buffers[0].is_null() {
+            //     let end_idx = self.command_buffers.iter()
+            //         .position(|&v| v.is_null())
+            //         .unwrap_or(self.command_buffers.len());
+            //     device.free_command_buffers(self.command_pool_ref, &self.command_buffers[..end_idx]);
+            // }
             let mut views = self.views.borrow_mut();
             for (_, view) in &mut *views {
                 view.destroy(&device);
@@ -2006,7 +1797,7 @@ impl Drop for InnerImage {
 }
 
 struct Extensions {
-    image_format_modifier: ImageDrmFormatModifier,
+    _image_format_modifier: ImageDrmFormatModifier,
     external_memory_fd: ExternalMemoryFd,
 }
 
@@ -2021,142 +1812,9 @@ impl Extensions {
     #[inline(always)]
     pub fn new(i: &ash::Instance, d: &ash::Device) -> Self {
         Extensions {
-            image_format_modifier: ImageDrmFormatModifier::new(i, d),
+            _image_format_modifier: ImageDrmFormatModifier::new(i, d),
             external_memory_fd: ExternalMemoryFd::new(i, d),
         }
-    }
-}
-
-#[derive(Debug)]
-struct FormatInfo {
-    vk: vk::Format,
-    drm: Fourcc,
-    properties: vk::FormatProperties,
-    modifiers: Arc<[vk::DrmFormatModifierPropertiesEXT]>,
-}
-
-impl FormatInfo {
-    fn get_known(phd: &PhysicalDevice) -> impl Iterator<Item = Self> + '_ {
-        use crate::backend::allocator::vulkan::format;
-        format::known_vk_formats().map(|(fourcc, vk_format)| Self::new(phd, fourcc, vk_format))
-    }
-    fn new(phd: &PhysicalDevice, fourcc: Fourcc, vk_format: vk::Format) -> Self {
-        let instance = phd.instance().handle();
-        let mut mod_list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut props = vk::FormatProperties2::builder().push_next(&mut mod_list).build();
-        unsafe {
-            instance.get_physical_device_format_properties2(phd.handle(), vk_format, &mut props);
-        }
-        let mut mod_props = Vec::with_capacity(mod_list.drm_format_modifier_count as _);
-        mod_list.p_drm_format_modifier_properties = mod_props.as_mut_ptr();
-        unsafe {
-            instance.get_physical_device_format_properties2(phd.handle(), vk_format, &mut props);
-            mod_props.set_len(mod_list.drm_format_modifier_count as _);
-        }
-        FormatInfo {
-            vk: vk_format,
-            drm: fourcc,
-            properties: props.format_properties,
-            modifiers: mod_props.into(),
-        }
-    }
-}
-
-
-#[derive(Debug)]
-struct QueueFamilies {
-    properties: Vec<vk::QueueFamilyProperties>,
-    graphics: Queue,
-}
-
-impl<'a> TryFrom<&'a PhysicalDevice> for QueueFamilies {
-    type Error = Error<'static>;
-    fn try_from(pd: &'a PhysicalDevice) -> Result<Self, Self::Error> {
-        let props = unsafe {
-            pd.instance()
-                .handle()
-                .get_physical_device_queue_family_properties(pd.handle())
-        };
-        let gfx = props.iter()
-            .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .map(Queue::with_index)
-            .ok_or(Error::NoGraphicsQueue)?;
-        Ok(QueueFamilies {
-            properties: props,
-            graphics: gfx,
-        })
-    }
-}
-
-impl QueueFamilies {
-    fn fill_device(&mut self, device: &ash::Device) {
-        self.graphics.fill_handle(device, 0);
-    }
-    fn present_queue(
-        &self,
-        pd: vk::PhysicalDevice,
-        surface: vk::SurfaceKHR,
-        ext: &ash::extensions::khr::Surface
-    ) -> Result<usize, Error<'static>> {
-        if let Some(&Queue { index, .. }) = [&self.graphics].into_iter()
-            .find(|&q| q.can_present(surface, ext, pd).ok() == Some(true)) {
-            return Ok(index);
-        }
-        let it = [
-            &self.graphics
-        ].into_iter()
-            .map(|q| q.can_present(surface, ext, pd).map(|v| (q.index, v)))
-            .chain({
-                (0..self.properties.len())
-                    .map(|idx| {
-                        Queue::with_index(idx)
-                            .can_present(surface, ext, pd)
-                            .map(|v| (idx, v))
-                    })
-            });
-        for r in it {
-            let (idx, can_present) = r?;
-            if can_present {
-                return Ok(idx);
-            }
-        }
-        Err(Error::NoPresentQueue)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Queue {
-    index: usize,
-    handle: vk::Queue,
-}
-
-impl Queue {
-    #[inline(always)]
-    const fn with_index(index: usize) -> Self {
-        Queue {
-            index,
-            handle: vk::Queue::null(),
-        }
-    }
-
-    fn fill_handle(&mut self, device: &ash::Device, queue_index: u32) {
-        let info = vk::DeviceQueueInfo2::builder()
-            .flags(vk::DeviceQueueCreateFlags::empty())
-            .queue_family_index(self.index as _)
-            .queue_index(queue_index);
-        self.handle = unsafe { device.get_device_queue2(&info) };
-    }
-
-    #[inline]
-    fn can_present(&self, surface: vk::SurfaceKHR, ext: &ash::extensions::khr::Surface, pd: vk::PhysicalDevice) -> Result<bool, Error<'static>> {
-        unsafe {
-            ext.get_physical_device_surface_support(pd, self.index as _, surface)
-        }.vk("vkGetPhysicalDeviceSurfaceSupportKHR")
-    }
-
-    #[inline(always)]
-    fn idx(&self) -> u32 {
-        self.index as _
     }
 }
 
@@ -2196,6 +1854,7 @@ pub enum Error<'a> {
     /// valid `GRAPHICS` queue family
     #[error("physical device had no graphics queue family")]
     NoGraphicsQueue,
+    /// Device didn't have a supported presentation queue
     #[error("physical device had no presentation queue for surface")]
     NoPresentQueue,
     /// Wrapper for [`vk::Result`], including `context` as the name of the vulkan function that
@@ -2217,12 +1876,17 @@ pub enum Error<'a> {
     UnknownFormat(DrmFormat),
     /// Occurs when [`ImportMem`] is called with an unsupported format
     #[error("unsupported memory import format: {0:?}")]
+    /// Desired import [`Fourcc`] drm format not supported
     UnknownMemoryFormat(Fourcc),
+    /// user supplied an unsupported [`wl_shm::Format`] value to [`ImportMemWl::import_shm_buffer`]
     #[error("unsupported wl_shm format: {0:?}")]
     UnknownShmFormat(wl_shm::Format),
+    /// device did not support required memory parameters
     #[error("no device memory type with bits: {bits:b} and flags {flags:?}")]
     NoMemoryType {
+        /// `memory_type_bits` from EX [`vk::ImageMemoryRequirements`]
         bits: u32,
+        /// flags that the memory must support that were not found
         flags: vk::MemoryPropertyFlags,
     },
     /// Occurs when [`Renderer::render`] is called without a target bound for the renderer
@@ -2232,16 +1896,23 @@ pub enum Error<'a> {
     /// already busy
     #[error("all command buffers already busy")]
     AllCommandBuffersBusy,
+    /// swapchain support not found for surface
     #[error("swapchain support not found for surface")]
     SwapchainSupport,
+    /// could not find compatible swapchain format
     #[error("could not find compatible swapchain format")]
     SwapchainFormat,
+    /// Feature named is unimplemented
     #[error("unimplemented: {0}")]
     Unimplemented(&'a str),
+    /// ?
     #[error("no renderer setup found for format: {0:?}")]
     RendererSetup(vk::Format),
+    /// an interrupt occured while waiting on a [`SyncPoint`]
     #[error("waiting for fence interrupted: {0}")]
     Interrupted(#[from] crate::backend::renderer::sync::Interrupted),
+    /// Returned by [`ImportMemWl::import_shm_buffer`] when the import causes an invalid access to
+    /// the buffer's memory
     #[error(transparent)]
     BufferAccess(#[from] crate::wayland::shm::BufferAccessError),
 }
@@ -2304,6 +1975,11 @@ trait DeviceExt {
         offset: usize,
         value: &T,
     );
+    fn create_single_command_buffer(
+        &self,
+        pool: vk::CommandPool,
+        level: vk::CommandBufferLevel,
+    ) -> Result<vk::CommandBuffer, Error<'static>>;
 }
 impl DeviceExt for ash::Device {
     fn memory_requirements(&self, image: vk::Image) -> vk::MemoryRequirements2 {
@@ -2348,6 +2024,33 @@ impl DeviceExt for ash::Device {
                 offset as _,
                 raw_data
             );
+        }
+    }
+    fn create_single_command_buffer(
+        &self,
+        pool: vk::CommandPool,
+        level: vk::CommandBufferLevel,
+    ) -> Result<vk::CommandBuffer, Error<'static>> {
+        use core::mem::MaybeUninit;
+        let mut ret = MaybeUninit::<vk::CommandBuffer>::zeroed();
+        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(pool)
+            .level(level)
+            .command_buffer_count(1)
+            .build();
+        unsafe {
+            let result = (self.fp_v1_0().allocate_command_buffers)(
+                self.handle(),
+                &alloc_info as *const _,
+                ret.as_mut_ptr(),
+            );
+            match result {
+                vk::Result::SUCCESS => Ok(ret.assume_init()),
+                e => Err(Error::Vk {
+                    context: "vkAllocateCommandBuffers",
+                    result: e,
+                }),
+            }
         }
     }
 }

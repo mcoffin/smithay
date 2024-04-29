@@ -1,10 +1,11 @@
+#![allow(missing_docs)]
 //! Abstractions that hopefully get rid of many of the platform-specific interactions w/ the vulkan
 //! WSI.
 //!
 //! EX: `vkCreateWin32SurfaceKHR` vs. `vkCreateWaylandSurfaceKHR`
 use ash::{extensions::khr::WaylandSurface, vk};
-use std::{error::Error, ffi::CStr, marker::PhantomData, os::raw::c_void, ptr::NonNull};
-use winit::raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
+use std::{ffi::CStr, marker::PhantomData, os::raw::c_void, ptr::NonNull};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub trait VulkanNativeWindow<'a> {
     fn required_extensions(&self) -> &'a [&'a CStr];

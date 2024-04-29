@@ -1,11 +1,8 @@
 use cgmath::{
-    prelude::*,
-    Matrix3,
     Matrix4,
     Vector2,
 };
 use ash::vk;
-use crate::utils::{Rectangle, Size};
 
 use super::{
     shaders::SOURCES as SHADERS,
@@ -453,10 +450,7 @@ impl From<vk::PipelineLayout> for PipelineLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{
-        offset_of,
-        size_of,
-    };
+    use std::mem::offset_of;
 
     #[test]
     fn uniform_data_offset_matches() {

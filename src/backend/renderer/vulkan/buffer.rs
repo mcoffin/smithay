@@ -1,8 +1,11 @@
 use ash::vk;
-use crate::vk_create_guarded;
-use std::{
-    num::NonZeroI32,
-    sync::Arc,
+use crate::{
+    vk_call,
+    vk_create_guarded,
+};
+use std::sync::{
+    Arc,
+    Weak,
 };
 use super::{
     memory::DeviceExtMemory,
@@ -11,21 +14,12 @@ use super::{
 };
 use scopeguard::ScopeGuard;
 
-macro_rules! vk_call {
-    ($dev:expr, $fn_name:ident ($($arg:expr),+ $(,)?)) => {
-        unsafe {
-            $dev.$fn_name($($arg),+)
-                .vk(concat!("vk_", stringify!($create_fn)))
-        }
-    };
-}
-
 #[derive(Debug)]
 pub struct StagingBuffer {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
-    device: Arc<super::Device>,
+    device: Weak<super::Device>,
 }
 
 impl StagingBuffer {
@@ -61,12 +55,14 @@ impl StagingBuffer {
             handle: ScopeGuard::into_inner(buffer),
             memory: ScopeGuard::into_inner(mem),
             size,
-            device: r.device.clone(),
+            device: Arc::downgrade(&r.device),
         })
     }
 
     pub fn upload(&self, data: &[u8], offset: vk::DeviceSize) -> Result<(), Error<'static>> {
-        let mut mem = self.device.map_memory_(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+        let device = self.device.upgrade()
+            .expect("device destroyed before staging buffer");
+        let mut mem = device.map_memory_(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
             .vk("vk_map_memory")?;
         let copy_size = std::cmp::min(mem.len() - offset as usize, data.len());
         mem[..copy_size].copy_from_slice(&data[..copy_size]);
@@ -77,20 +73,16 @@ impl StagingBuffer {
     pub fn handle(&self) -> vk::Buffer {
         self.handle
     }
+}
 
-    #[inline(always)]
-    pub fn memory(&self) -> vk::DeviceMemory {
-        self.memory
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.size as _
-    }
-
-    #[inline(always)]
-    pub fn size(&self) -> vk::DeviceSize {
-        self.size
+impl Drop for StagingBuffer {
+    fn drop(&mut self) {
+        let device = self.device.upgrade()
+            .expect("device destroyed before staging buffer");
+        unsafe {
+            device.destroy_buffer(self.handle, None);
+            device.free_memory(self.memory, None);
+        }
     }
 }
 
@@ -108,4 +100,85 @@ impl RendererExt for super::VulkanRenderer {
             })
             .map(|(idx, ..)| idx as _)
     }
+}
+
+pub fn record_copy_buffer_image(
+    device: &ash::Device,
+    queue: &super::Queue,
+    cb: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    image: &super::InnerImage,
+    size: [u32; 2],
+    offset: vk::DeviceSize,
+) -> Result<(), Error<'static>> {
+    let begin_info = vk::CommandBufferBeginInfo::builder()
+        .flags(vk::CommandBufferUsageFlags::empty());
+    vk_call!(device, begin_command_buffer(cb, &begin_info))?;
+    let queue_idx = queue.index as u32;
+    let p_size: vk::DeviceSize = match image.format.vk {
+        vk::Format::B8G8R8_SRGB
+        | vk::Format::R8G8B8_SRGB => 3,
+        vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB => 4,
+        vk::Format::R16G16B16A16_SFLOAT => 8,
+        _ => unimplemented!(),
+    };
+    let full_size = (size[0] as vk::DeviceSize) * p_size * (size[1] as vk::DeviceSize);
+    let buf_barrier = vk::BufferMemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .src_queue_family_index(queue_idx)
+        .dst_queue_family_index(queue_idx)
+        .buffer(buffer)
+        .offset(0)
+        .size(full_size)
+        .build();
+    let img_barriers = [
+        vk::ImageMemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(image.layout.get())
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(queue_idx)
+            .dst_queue_family_index(queue_idx)
+            .image(image.image)
+            .subresource_range(super::COLOR_SINGLE_LAYER)
+            .build(),
+    ];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[], &[buf_barrier], &img_barriers,
+        );
+        device.cmd_copy_buffer_to_image(
+            cb,
+            buffer, image.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[
+                vk::BufferImageCopy {
+                    buffer_offset: offset as _,
+                    buffer_row_length: p_size as u32 * size[0],
+                    buffer_image_height: size[1],
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: vk::Extent3D {
+                        width: size[0],
+                        height: size[1],
+                        depth: 1,
+                    },
+                }
+            ]
+        );
+    }
+    vk_call!(device, end_command_buffer(cb))
 }

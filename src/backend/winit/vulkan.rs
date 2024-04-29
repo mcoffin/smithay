@@ -5,7 +5,6 @@ use crate::backend::{
     renderer::vulkan::{
         Error as VkRendererError,
         VulkanRenderer,
-        Device,
         ErrorExt,
     },
     vulkan::{
@@ -13,7 +12,6 @@ use crate::backend::{
         InstanceError,
         PhysicalDevice,
         Surface as VulkanSurface,
-        native::TryVulkanNativeWindow,
     },
 };
 use std::{
@@ -22,11 +20,17 @@ use std::{
 
 type WinitVulkanBackend = WinitGraphicsBackend<WinitVulkanGraphics>;
 
+/// Create a new [`WinitVulkanBackend`]
+///
+/// See [`super::init`]
 #[inline]
 pub fn init() -> Result<(WinitVulkanBackend, WinitEventLoop), WinitError> {
     init_with_builder(builder())
 }
 
+/// Create a new [`WinitVulkanBackend`]
+///
+/// See [`super::init_with_builder`]
 pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanBackend, WinitEventLoop), WinitError> {
     let span = info_span!("backend_winit", window = tracing::field::Empty);
     let _guard = span.enter();
@@ -91,19 +95,10 @@ impl WinitVulkanGraphics {
         Self::new(pd, surface)
     }
 
-    #[inline(always)]
-    fn instance(&self) -> &Instance {
-        self.physical_device.instance()
-    }
-
+    /// Gets a reference to the [`PhysicalDevice`] instance in use by this backend
     #[inline(always)]
     pub fn physical_device(&self) -> &PhysicalDevice {
         &self.physical_device
-    }
-
-    #[inline(always)]
-    fn device(&self) -> &ash::Device {
-        self.renderer.device()
     }
 }
 

@@ -1,6 +1,5 @@
 use cgmath::{
     prelude::*,
-    Matrix3,
     Matrix4,
 };
 use crate::utils::Transform;

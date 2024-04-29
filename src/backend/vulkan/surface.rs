@@ -17,6 +17,7 @@ impl Drop for Surface {
 }
 
 impl Surface {
+    /// Creates a new vulkan surface given a loaded extension and a [`vk::SurfaceKHR`] handle
     #[inline(always)]
     pub fn new(ext: VkSurface, handle: vk::SurfaceKHR) -> Self {
         Surface {
@@ -35,11 +36,13 @@ impl Surface {
         self.handle
     }
 
+    /// Gets a reference to the extension vtable
     #[inline(always)]
     pub fn extension(&self) -> &VkSurface {
         &self.surface
     }
 
+    /// Gives the size (width, height) of the surface (in pixels)
     #[inline(always)]
     pub fn extent(&self) -> vk::Extent2D {
         self.extent.get()

@@ -1,7 +1,5 @@
 use ash::vk;
-use crate::{
-    backend::renderer::sync::{Fence, SyncPoint}, fn_name
-};
+use crate::backend::renderer::sync::{Fence, SyncPoint};
 use tracing::*;
 use super::{
     Error,

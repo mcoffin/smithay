@@ -133,10 +133,7 @@ fn vk_compile_shaders() -> Result<(), Box<dyn std::error::Error>> {
             Command,
             ExitStatus,
         },
-        path::{
-            Path,
-            PathBuf,
-        },
+        path::PathBuf,
         ffi::OsString,
     };
     #[derive(Debug, thiserror::Error)]
