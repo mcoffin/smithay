@@ -97,11 +97,11 @@ impl InnerImageView {
         Ok(ScopeGuard::into_inner(ret))
     }
     pub(super) unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.image_view != vk::ImageView::null() {
-            device.destroy_image_view(self.image_view, None);
-        }
         if self.ds_pool != vk::DescriptorPool::null() {
             device.destroy_descriptor_pool(self.ds_pool, None);
+        }
+        if self.image_view != vk::ImageView::null() {
+            device.destroy_image_view(self.image_view, None);
         }
     }
 

@@ -86,6 +86,9 @@ vk_format_table! {
     Abgr2101010 => A2B10G10R10_UNORM_PACK32,
     #[cfg(target_endian = "little")]
     Xbgr2101010 => A2B10G10R10_UNORM_PACK32,
+
+    Abgr16161616f => R16G16B16A16_SFLOAT,
+    Xbgr16161616f => R16G16B16A16_SFLOAT,
 }
 
 pub(crate) fn known_vk_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {

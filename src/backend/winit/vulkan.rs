@@ -63,9 +63,9 @@ pub fn init_with_builder(builder: WindowBuilder) -> Result<(WinitVulkanBackend, 
 /// [`WinitGraphics`] implementation details for a [`VulkanRenderer`]
 #[derive(Debug)]
 pub struct WinitVulkanGraphics {
+    surface: Rc<VulkanSurface>,
     renderer: VulkanRenderer,
     physical_device: PhysicalDevice,
-    surface: Rc<VulkanSurface>,
 }
 
 impl WinitVulkanGraphics {
@@ -118,6 +118,16 @@ impl WinitGraphics for WinitVulkanGraphics {
         _damage: Option<&mut [Rectangle<i32, Physical>]>,
     ) -> Result<(), crate::backend::SwapBuffersError> {
         Ok(())
+    }
+}
+
+impl Drop for WinitVulkanGraphics {
+    #[tracing::instrument(skip(self), name = "winit_vulkan_destroy")]
+    fn drop(&mut self) {
+        use crate::backend::renderer::Unbind;
+        if let Err(error) = self.renderer.unbind() {
+            error!(?error, "failed to unbind renderer");
+        }
     }
 }
 

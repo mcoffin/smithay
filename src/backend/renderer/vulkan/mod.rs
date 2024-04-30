@@ -102,6 +102,7 @@ pub struct VulkanRenderer {
     debug_flags: DebugFlags,
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     shm_images: Vec<WeakVulkanImage>,
+    shm_images_tmp: Vec<Arc<InnerImage>>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     command_pool: OwnedHandle<vk::CommandPool, Device>,
     target: Option<VulkanTarget>,
@@ -225,6 +226,7 @@ impl VulkanRenderer {
             debug_flags: DebugFlags::empty(),
             dmabuf_cache: HashMap::new(),
             shm_images: Vec::new(),
+            shm_images_tmp: Vec::new(),
             memory_props,
             command_pool: pool,
             target: None,
@@ -361,7 +363,7 @@ impl VulkanRenderer {
 
     fn cleanup(&mut self) -> Option<SubmittedFrame> {
         self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
-        self.shm_images.retain(|img| img.upgrade().is_some());
+        // self.shm_images.retain(|img| img.upgrade().is_some());
         self.cleanup_pending_threshold(5)
     }
 
@@ -404,16 +406,17 @@ impl VulkanRenderer {
             .peekable();
         let ret = transition_it.has_next();
         if ret {
-            let graphics_idx = self.queues.graphics.idx();
+            // let graphics_idx = self.queues.graphics.idx();
             let barriers = transition_it.map(|image| {
+                let old_layout = image.0.layout.get();
                 image.0.layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 vk::ImageMemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .old_layout(old_layout)
                     .new_layout(desired_layout)
-                    .src_queue_family_index(graphics_idx)
-                    .dst_queue_family_index(graphics_idx)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image.0.image)
                     .subresource_range(COLOR_SINGLE_LAYER)
                     .build()
@@ -431,6 +434,15 @@ impl VulkanRenderer {
         ret
     }
 }
+
+// impl Drop for VulkanRenderer {
+//     #[tracing::instrument(skip(self), name = "vulkan_renderer_destroy")]
+//     fn drop(&mut self) {
+//         if let Err(error) = self.wait_all_pending() {
+//             error!(?error, "error while waiting on pending frames to finish");
+//         }
+//     }
+// }
 
 /// [`Iterator`] implementation for iterating over [`VulkanRenderer::pending_frames`]
 #[repr(transparent)]
@@ -527,18 +539,6 @@ impl Renderer for VulkanRenderer {
         };
         let setup = self.render_setups.get(&format)
             .expect("render setup did not exist");
-        // let mut ret = VulkanFrame {
-        //     renderer: self,
-        //     target,
-        //     setup,
-        //     command_buffer,
-        //     image: vk::Image::null(),
-        //     image_idx: 0,
-        //     image_ready: [vk::Semaphore::null(); 2],
-        //     submit_ready: MaybeOwned::Owned(vk::Semaphore::null()),
-        //     output_size,
-        //     bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
-        // };
 
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -744,6 +744,7 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
 
 impl super::Unbind for VulkanRenderer {
     fn unbind(&mut self) -> Result<(), <Self as Renderer>::Error> {
+        self.wait_all_pending()?;
         self.target = None;
         Ok(())
     }
@@ -758,6 +759,7 @@ const MAX_PLANES: usize = 4;
 fn imported_usage_flags() -> vk::ImageUsageFlags {
     vk::ImageUsageFlags::SAMPLED
     | vk::ImageUsageFlags::TRANSFER_SRC
+    | vk::ImageUsageFlags::TRANSFER_DST
 }
 
 impl ImportDma for VulkanRenderer {
@@ -1059,8 +1061,12 @@ impl ImportMemWl for VulkanRenderer {
         surface: Option<&compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        with_buffer_contents(buffer, |ptr, len, data| -> Result<_, <Self as Renderer>::Error> {
-            let BufferData { offset, width, height, format: shm_format, .. } = data;
+        let ret = with_buffer_contents(buffer, |ptr, len, data| -> Result<_, <Self as Renderer>::Error> {
+            let BufferData { offset, width, height, format: shm_format, stride } = data;
+
+            let bytes_per_pixel = stride / width;
+
+            debug!(len, buffer_data = ?data, "got buffer data");
 
             // try cache first
             let image = if let Some(cached) = surface.and_then(|v| v.cached_image(&*self, &data)) {
@@ -1083,7 +1089,7 @@ impl ImportMemWl for VulkanRenderer {
                     .mip_levels(1)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .tiling(vk::ImageTiling::LINEAR)
                     .usage(imported_usage_flags())
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .queue_family_indices(queue_family_indices)
@@ -1105,7 +1111,11 @@ impl ImportMemWl for VulkanRenderer {
                     .build();
                 let memory = vk_create_guarded!(device, allocate_memory(&info, None), free_memory(None))?;
                 vk_call!(device, bind_image_memory(*image, *memory, 0))?;
-                let buffer = StagingBuffer::new(self, len as vk::DeviceSize, vk::SharingMode::EXCLUSIVE)?;
+
+                let buf_size = ((width * height) as usize) * bytes_per_pixel as usize;
+                debug_assert!(offset as vk::DeviceSize + buf_size as vk::DeviceSize <= len as vk::DeviceSize);
+
+                let buffer = StagingBuffer::new(self, buf_size as vk::DeviceSize, vk::SharingMode::EXCLUSIVE)?;
                 let mut ret = InnerImage {
                     image: ScopeGuard::into_inner(image),
                     memories: [vk::DeviceMemory::null(); MAX_PLANES],
@@ -1122,11 +1132,13 @@ impl ImportMemWl for VulkanRenderer {
 
             // update data in staging buffer
             let b_data = unsafe {
-                std::slice::from_raw_parts(ptr.offset(offset as isize), len)
+                std::slice::from_raw_parts(ptr, len)
             };
+            // TODO try not repeat work
             let buffer = image.buffer.as_ref()
                 .expect("shm image must have a buffer");
-            buffer.upload(b_data, offset as vk::DeviceSize)?;
+            let b_data = &b_data[offset as usize..buffer.len()];
+            buffer.upload(b_data, 0)?;
 
             // submit a copy from the staging buffer to the main image
             let cb = self.device.create_single_command_buffer(
@@ -1139,8 +1151,9 @@ impl ImportMemWl for VulkanRenderer {
             buffer::record_copy_buffer_image(
                 self.device(),
                 &self.queues.graphics,
-                *cb, buffer.handle(),
-                &image, [w, h], 0
+                *cb, buffer,
+                &image, [w, h], 0,
+                stride as _
             )?;
             let info = vk::FenceCreateInfo::builder()
                 .flags(vk::FenceCreateFlags::empty());
@@ -1159,8 +1172,44 @@ impl ImportMemWl for VulkanRenderer {
             image.layout.set(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
             vk_call!(self.device(), wait_for_fences(&[*fence], true, u64::MAX))?;
 
+            // self.shm_images.push(Arc::downgrade(&image));
+
+            if let Some(surface) = surface.as_ref() {
+                let mut cache = surface
+                    .data_map
+                    .get::<Rc<RefCell<ShmCache>>>()
+                    .unwrap()
+                    .borrow_mut();
+                cache.insert(self.id(), image.clone());
+            }
+
             Ok(VulkanImage(image))
-        }).map_err(Error::BufferAccess)?
+        }).map_err(Error::BufferAccess)?;
+        match &ret {
+            Ok(VulkanImage(ref inner)) => {
+                // if let Ok(VulkanImage(ref inner)) = &ret {
+                // }
+                self.shm_images.push(Arc::downgrade(inner));
+                self.shm_images_tmp.push(inner.clone());
+            },
+            Err(error) => {
+                error!(?error, "failed");
+            },
+        }
+        debug!(
+            lengths = ?[
+                self.shm_images.len(),
+                self.shm_images_tmp.len(),
+            ],
+            ?ret,
+            shm_images = ?self.shm_images.as_slice(),
+            shm_images_tmp = ?self.shm_images_tmp.as_slice(),
+            "finished import"
+        );
+        // if let Ok(image) = &ret {
+        //     self.shm_images.push(image.clone());
+        // }
+        ret
     }
 }
 
@@ -1672,6 +1721,7 @@ impl VulkanImage {
         VulkanImage(Arc::new(img))
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn downgrade(&self) -> WeakVulkanImage {
         Arc::downgrade(&self.0)
@@ -1711,18 +1761,6 @@ impl InnerImage {
 
     #[inline]
     fn has_alpha(&self) -> bool {
-        trait VkFormatExt {
-            fn has_alpha(self) -> bool;
-        }
-        impl VkFormatExt for vk::Format {
-            fn has_alpha(self) -> bool {
-                !matches!(
-                    self,
-                    vk::Format::B8G8R8_SRGB
-                    | vk::Format::R8G8B8_SRGB
-                )
-            }
-        }
         self.format.vk.has_alpha()
     }
 
@@ -2037,6 +2075,32 @@ impl DeviceExt for ash::Device {
                     result: e,
                 }),
             }
+        }
+    }
+}
+
+trait VkFormatExt {
+    fn has_alpha(self) -> bool;
+    fn bytes_per_pixel(&self) -> usize;
+}
+impl VkFormatExt for vk::Format {
+    fn has_alpha(self) -> bool {
+        !matches!(
+            self,
+            vk::Format::B8G8R8_SRGB
+            | vk::Format::R8G8B8_SRGB
+        )
+    }
+    fn bytes_per_pixel(&self) -> usize {
+        match *self {
+            vk::Format::B8G8R8_SRGB
+            | vk::Format::R8G8B8_SRGB => 3,
+            vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB => 4,
+            vk::Format::R16G16B16A16_SFLOAT => 8,
+            _ => unimplemented!(),
         }
     }
 }

@@ -13,6 +13,7 @@ use super::{
     ErrorExt,
 };
 use scopeguard::ScopeGuard;
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct StagingBuffer {
@@ -23,6 +24,7 @@ pub struct StagingBuffer {
 }
 
 impl StagingBuffer {
+    #[tracing::instrument(skip(r), name = "new_staging_buffer")]
     pub fn new(
         r: &super::VulkanRenderer,
         size: vk::DeviceSize,
@@ -38,6 +40,7 @@ impl StagingBuffer {
             .build();
         let buffer = vk_create_guarded!(device, create_buffer(&info, None), destroy_buffer(None))?;
         let reqs = unsafe { device.get_buffer_memory_requirements(*buffer) };
+        debug!(requirements = ?reqs, "got buffer memory requirements");
         let host_props = vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
         let mem_idx = r.find_memory_type_r(reqs.memory_type_bits, host_props)?;
@@ -59,12 +62,20 @@ impl StagingBuffer {
         })
     }
 
+    #[tracing::instrument(
+        skip(self, data),
+        fields(
+            data_len = %data.len(),
+            buffer_len = %self.size
+        )
+    )]
     pub fn upload(&self, data: &[u8], offset: vk::DeviceSize) -> Result<(), Error<'static>> {
+        debug!("upload");
         let device = self.device.upgrade()
             .expect("device destroyed before staging buffer");
-        let mut mem = device.map_memory_(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+        let mut mem = device.map_memory_(self.memory, offset, self.size, vk::MemoryMapFlags::empty())
             .vk("vk_map_memory")?;
-        let copy_size = std::cmp::min(mem.len() - offset as usize, data.len());
+        let copy_size = std::cmp::min(mem.len(), data.len());
         mem[..copy_size].copy_from_slice(&data[..copy_size]);
         Ok(())
     }
@@ -72,6 +83,11 @@ impl StagingBuffer {
     #[inline(always)]
     pub fn handle(&self) -> vk::Buffer {
         self.handle
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.size as _
     }
 }
 
@@ -106,34 +122,25 @@ pub fn record_copy_buffer_image(
     device: &ash::Device,
     queue: &super::Queue,
     cb: vk::CommandBuffer,
-    buffer: vk::Buffer,
+    staging_buffer: &StagingBuffer,
     image: &super::InnerImage,
     size: [u32; 2],
     offset: vk::DeviceSize,
+    stride: u32,
 ) -> Result<(), Error<'static>> {
+    let buffer = staging_buffer.handle();
     let begin_info = vk::CommandBufferBeginInfo::builder()
         .flags(vk::CommandBufferUsageFlags::empty());
     vk_call!(device, begin_command_buffer(cb, &begin_info))?;
     let queue_idx = queue.index as u32;
-    let p_size: vk::DeviceSize = match image.format.vk {
-        vk::Format::B8G8R8_SRGB
-        | vk::Format::R8G8B8_SRGB => 3,
-        vk::Format::B8G8R8A8_UNORM
-        | vk::Format::B8G8R8A8_SRGB
-        | vk::Format::R8G8B8A8_UNORM
-        | vk::Format::R8G8B8A8_SRGB => 4,
-        vk::Format::R16G16B16A16_SFLOAT => 8,
-        _ => unimplemented!(),
-    };
-    let full_size = (size[0] as vk::DeviceSize) * p_size * (size[1] as vk::DeviceSize);
     let buf_barrier = vk::BufferMemoryBarrier::builder()
         .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
         .src_queue_family_index(queue_idx)
         .dst_queue_family_index(queue_idx)
         .buffer(buffer)
-        .offset(0)
-        .size(full_size)
+        .offset(offset)
+        .size(staging_buffer.size)
         .build();
     let img_barriers = [
         vk::ImageMemoryBarrier::builder()
@@ -155,29 +162,31 @@ pub fn record_copy_buffer_image(
             vk::DependencyFlags::empty(),
             &[], &[buf_barrier], &img_barriers,
         );
+        let copies = [
+            vk::BufferImageCopy {
+                buffer_offset: offset,
+                buffer_row_length: size[0],
+                buffer_image_height: size[1],
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: size[0],
+                    height: size[1],
+                    depth: 1,
+                },
+            }
+        ];
+        debug!(?copies, "copying buffer to image");
         device.cmd_copy_buffer_to_image(
             cb,
             buffer, image.image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[
-                vk::BufferImageCopy {
-                    buffer_offset: offset as _,
-                    buffer_row_length: p_size as u32 * size[0],
-                    buffer_image_height: size[1],
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                    image_extent: vk::Extent3D {
-                        width: size[0],
-                        height: size[1],
-                        depth: 1,
-                    },
-                }
-            ]
+            &copies,
         );
     }
     vk_call!(device, end_command_buffer(cb))

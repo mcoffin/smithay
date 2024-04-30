@@ -335,6 +335,8 @@ impl SupportDetails {
     }
     pub fn choose_format(&self) -> Option<vk::SurfaceFormatKHR> {
         const SUPPORTED_FORMATS: &[vk::Format] = &[
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::Format::R8G8B8A8_SRGB,
             vk::Format::B8G8R8A8_SRGB,
         ];
         SUPPORTED_FORMATS.iter().find_map(|&fmt| {
