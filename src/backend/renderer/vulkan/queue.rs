@@ -101,9 +101,4 @@ impl Queue {
             ext.get_physical_device_surface_support(pd, self.index as _, surface)
         }.vk("vkGetPhysicalDeviceSurfaceSupportKHR")
     }
-
-    #[inline(always)]
-    pub fn idx(&self) -> u32 {
-        self.index as _
-    }
 }

@@ -1,5 +1,8 @@
 use ash::vk;
-use crate::backend::renderer::sync::{Fence, SyncPoint};
+use crate::{
+    vk_call,
+    backend::renderer::sync::{Fence, SyncPoint},
+};
 use tracing::*;
 use super::{
     Error,
@@ -7,6 +10,7 @@ use super::{
     SubmittedFrame,
 };
 use std::{
+    fmt,
     mem::ManuallyDrop,
     sync::mpsc,
 };
@@ -28,7 +32,7 @@ impl VulkanFence {
 
     #[inline(always)]
     pub fn handle(&self) -> vk::Fence {
-        self.frame.fence
+        self.frame.fence()
     }
 
     #[inline]
@@ -135,4 +139,52 @@ impl DeviceExtFence for ash::Device {
 pub enum FenceStatus {
     Signaled,
     Unsignaled,
+}
+
+pub struct ScopeFence<'a> {
+    handle: vk::Fence,
+    device: &'a ash::Device,
+}
+
+impl<'a> ScopeFence<'a> {
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn handle(&self) -> vk::Fence {
+        self.handle
+    }
+}
+
+impl<'a> TryFrom<&'a ash::Device> for ScopeFence<'a> {
+    type Error = Error<'static>;
+    fn try_from(device: &'a ash::Device) -> Result<Self, Self::Error> {
+        const INFO: vk::FenceCreateInfo = vk::FenceCreateInfo {
+            s_type: vk::StructureType::FENCE_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: vk::FenceCreateFlags::empty(),
+        };
+        vk_call!(device, create_fence(&INFO, None)).map(|v| ScopeFence {
+            handle: v,
+            device,
+        })
+    }
+}
+
+impl<'a> fmt::Debug for ScopeFence<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopeFence")
+            .field("handle", &self.handle)
+            .field("device", &self.device.handle())
+            .finish()
+    }
+}
+
+impl<'a> Drop for ScopeFence<'a> {
+    fn drop(&mut self) {
+        if self.handle != vk::Fence::null() {
+            if let Err(error) = vk_call!(self.device, wait_for_fences(&[self.handle], true, u64::MAX)) {
+                error!(?error, "error waiting on fence");
+            }
+            unsafe { self.device.destroy_fence(self.handle, None); }
+        }
+    }
 }

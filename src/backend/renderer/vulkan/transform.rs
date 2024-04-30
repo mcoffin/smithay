@@ -19,3 +19,13 @@ impl TransformExt for Transform {
         }
     }
 }
+
+/// Matrix that equates to 2D scale by 2.0, and translate by (-1.0, -1.0)
+///
+/// translates 0-based coordinates to 0-centered coordinates for rectangle ops
+pub const MAT4_MODEL_BOX: Matrix4::<f32> = Matrix4::new(
+    2.0, 0.0, 0.0, 0.0,
+    0.0, 2.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    -1.0, -1.0, 0.0, 1.0
+);

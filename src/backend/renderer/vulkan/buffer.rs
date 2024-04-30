@@ -126,7 +126,6 @@ pub fn record_copy_buffer_image(
     image: &super::InnerImage,
     size: [u32; 2],
     offset: vk::DeviceSize,
-    stride: u32,
 ) -> Result<(), Error<'static>> {
     let buffer = staging_buffer.handle();
     let begin_info = vk::CommandBufferBeginInfo::builder()

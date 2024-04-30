@@ -93,7 +93,7 @@ use super::drm::DrmNode;
 pub mod native;
 mod surface;
 pub mod util;
-use native::{TryVulkanNativeWindow, VulkanNativeWindow};
+use native::TryVulkanNativeWindow;
 pub use surface::Surface;
 mod inner;
 mod phd;
