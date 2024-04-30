@@ -1,6 +1,6 @@
 use super::MAX_PLANES;
 use crate::backend::allocator::{
-    dmabuf::Dmabuf,
+    dmabuf::{Dmabuf, WeakDmabuf},
     Buffer,
 };
 use ash::{extensions::khr::ExternalMemoryFd, vk};
@@ -8,6 +8,8 @@ use std::{
     fmt,
     ops::Deref,
     os::fd::{AsRawFd, BorrowedFd},
+    sync::Weak,
+    rc,
 };
 
 #[derive(Clone, Copy)]
@@ -143,5 +145,40 @@ impl<T: Buffer> BufferExtVulkan for T {
             width: self.width(),
             height: self.height(),
         }
+    }
+}
+
+/// Helper trait for [`Weak`]-like pointers, to see if all the strong references are gone, without
+/// attmempting to call [`Weak::upgrade`] and drop the result in the success case
+pub trait WeakExt {
+    /// returns true if all strong references to this value are gone
+    fn is_gone(&self) -> bool;
+}
+
+impl<T> WeakExt for Weak<T> {
+    #[inline(always)]
+    fn is_gone(&self) -> bool {
+        // file:///home/mcoffin/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/share/doc/rust/html/std/sync/struct.Weak.html#method.weak_count
+        //
+        // more efficient than `upgrade().is_some()` and dropping on the success case
+        self.strong_count() == 0
+    }
+}
+
+impl<T> WeakExt for rc::Weak<T> {
+    #[inline(always)]
+    fn is_gone(&self) -> bool {
+        // according to [the
+        // docs](file:///home/mcoffin/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/share/doc/rust/html/std/rc/struct.Weak.html#method.weak_count)
+        // this will return 0 if all the strong pointers are gone, and checking that is more
+        // efficient than doing `upgrade().is_some()`, and then dropping the result
+        self.weak_count() == 0
+    }
+}
+
+impl WeakExt for WeakDmabuf {
+    #[inline(always)]
+    fn is_gone(&self) -> bool {
+        WeakDmabuf::is_gone(self)
     }
 }

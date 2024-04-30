@@ -79,6 +79,7 @@ use render_pass::{
     UniformDataVert,
     UniformDataFrag,
 };
+use transform::TransformExt;
 use queue::{
     QueueFamilies,
     Queue,
@@ -359,9 +360,22 @@ impl VulkanRenderer {
         found_finished.or(received)
     }
 
+    #[tracing::instrument(skip(self), name = "vulkan_renderer_cleanup")]
+    #[profiling::function]
     fn cleanup(&mut self) -> Option<SubmittedFrame> {
+        let has_drops = || {
+            self.dmabuf_cache.keys()
+                .any(WeakExt::is_gone)
+            || self.shm_images.iter()
+                .any(WeakExt::is_gone)
+        };
+        if has_drops() {
+            if let Err(error) = self.wait_all_pending() {
+                error!(?error, "error waiting on pending frames");
+            }
+        }
         self.dmabuf_cache.retain(|entry, _| entry.upgrade().is_some());
-        // self.shm_images.retain(|img| img.upgrade().is_some());
+        self.shm_images.retain(|img| img.upgrade().is_some());
         self.cleanup_pending_threshold(5)
     }
 
@@ -633,7 +647,7 @@ impl Renderer for VulkanRenderer {
         };
         let submit_fence = prev.as_mut()
             .and_then(SubmittedFrame::take_fence)
-            .unwrap_or_else(Default::default);
+            .unwrap_or_default();
 
         let ret = VulkanFrame {
             renderer: self,
@@ -1559,7 +1573,7 @@ impl<'a> Frame for VulkanFrame<'a> {
                 color,
             },
         };
-        trace!(?data.vert.transform, ?data.vert.tex_offset, ?data.vert.tex_extent, "pushing constants");
+        trace!(?data.vert, "pushing constants");
         unsafe {
             self.push_constants(&data);
             self.rect_viewport(&dst);
@@ -1597,8 +1611,11 @@ impl<'a> Frame for VulkanFrame<'a> {
         let (tw, th) = (texture.width(), texture.height());
         let data = UniformData {
             vert: UniformDataVert {
-                // transform: src_transform.to_matrix(),
-                transform: MAT4_MODEL_BOX,
+                transform: if let Some(src_transform) = src_transform.to_matrix() {
+                    src_transform * MAT4_MODEL_BOX
+                } else {
+                    MAT4_MODEL_BOX
+                },
                 tex_offset: Vector2::new(
                     (src.loc.x / (tw as f64)) as f32,
                     (src.loc.y / (th as f64)) as f32,
@@ -1712,12 +1729,6 @@ impl VulkanImage {
     #[inline(always)]
     fn new(img: InnerImage) -> Self {
         VulkanImage(Arc::new(img))
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn downgrade(&self) -> WeakVulkanImage {
-        Arc::downgrade(&self.0)
     }
 }
 
