@@ -102,7 +102,6 @@ pub struct VulkanRenderer {
     debug_flags: DebugFlags,
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
     shm_images: Vec<WeakVulkanImage>,
-    shm_images_tmp: Vec<Arc<InnerImage>>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     command_pool: OwnedHandle<vk::CommandPool, Device>,
     target: Option<VulkanTarget>,
@@ -226,7 +225,6 @@ impl VulkanRenderer {
             debug_flags: DebugFlags::empty(),
             dmabuf_cache: HashMap::new(),
             shm_images: Vec::new(),
-            shm_images_tmp: Vec::new(),
             memory_props,
             command_pool: pool,
             target: None,
@@ -1190,20 +1188,15 @@ impl ImportMemWl for VulkanRenderer {
                 // if let Ok(VulkanImage(ref inner)) = &ret {
                 // }
                 self.shm_images.push(Arc::downgrade(inner));
-                self.shm_images_tmp.push(inner.clone());
             },
             Err(error) => {
                 error!(?error, "failed");
             },
         }
         debug!(
-            lengths = ?[
-                self.shm_images.len(),
-                self.shm_images_tmp.len(),
-            ],
             ?ret,
             shm_images = ?self.shm_images.as_slice(),
-            shm_images_tmp = ?self.shm_images_tmp.as_slice(),
+            n_shm_images = self.shm_images.len(),
             "finished import"
         );
         // if let Ok(image) = &ret {
