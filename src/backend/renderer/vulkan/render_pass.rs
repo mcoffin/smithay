@@ -3,7 +3,10 @@ use cgmath::{
     Vector2,
 };
 use ash::vk;
-
+use crate::backend::allocator::vulkan::format::{
+    FormatMapping,
+    FORMAT_MAPPINGS,
+};
 use super::{
     shaders::SOURCES as SHADERS,
     shaders::ShaderModule,
@@ -20,6 +23,7 @@ use std::{
     sync::Arc,
 };
 use scopeguard::ScopeGuard;
+use tracing::debug;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -46,7 +50,7 @@ pub struct UniformData {
 #[derive(Debug)]
 pub struct RenderSetup {
     device: Arc<super::Device>,
-    pub format: vk::Format,
+    pub format: FormatMapping,
     handle: vk::RenderPass,
     pub usage_flags: vk::ImageUsageFlags,
     layouts: [PipelineLayout; 2],
@@ -69,7 +73,7 @@ static PUSH_CONSTANT_RANGES: [vk::PushConstantRange; 2] = [
 impl RenderSetup {
     pub fn new(
         device: Arc<super::Device>,
-        color_format: vk::Format,
+        color_format: FormatMapping,
         initial_layout: vk::ImageLayout,
         final_layout: vk::ImageLayout,
     ) -> Result<Self, Error<'static>> {
@@ -181,13 +185,17 @@ impl RenderSetup {
                 .color_attachments(&color_attachments)
                 .build(),
         ];
+        let fmt = color_format.srgb()
+            .filter(|&v| v != vk::Format::default())
+            .unwrap_or(color_format.format);
         let color_attachments = [
             color_attachment(
-                color_format,
+                fmt,
                 initial_layout,
                 final_layout,
             )
         ];
+        debug!(?color_attachments, "creating render pass");
         let create_info = vk::RenderPassCreateInfo::builder()
             .attachments(&color_attachments)
             .subpasses(&subpasses);
@@ -338,7 +346,7 @@ const fn color_attachment(
 ) -> vk::AttachmentDescription {
     vk::AttachmentDescription {
         flags: vk::AttachmentDescriptionFlags::empty(),
-        format,
+        format: format,
         samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::LOAD,
         store_op: vk::AttachmentStoreOp::STORE,

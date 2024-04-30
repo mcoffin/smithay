@@ -10,6 +10,10 @@ use crate::{
         allocator::{
             dmabuf::{Dmabuf, WeakDmabuf},
             Buffer, Format as DrmFormat, Fourcc, Modifier as DrmModifier,
+            vulkan::format::{
+                FormatMapping,
+                FORMAT_MAPPINGS,
+            },
         },
         drm::DrmNode,
         renderer::{sync::SyncPoint, DebugFlags, Frame, Renderer, Texture, TextureFilter},
@@ -108,7 +112,7 @@ pub struct VulkanRenderer {
     target: Option<VulkanTarget>,
     upscale_filter: vk::Filter,
     downscale_filter: vk::Filter,
-    render_setups: HashMap<vk::Format, RenderSetup>,
+    render_setups: HashMap<FormatMapping, RenderSetup>,
     submitted_frames: (mpsc::Sender<SubmittedFrame>, mpsc::Receiver<SubmittedFrame>),
     pending_frames: LinkedList<SubmittedFrame>,
 }
@@ -251,9 +255,11 @@ impl VulkanRenderer {
         vk::ExtExternalMemoryDmaBufFn::name().as_ptr(),
         vk::KhrExternalMemoryFdFn::name().as_ptr(),
         vk::KhrSwapchainFn::name().as_ptr(),
+        vk::KhrSwapchainMutableFormatFn::name().as_ptr(),
         // < 1.2
         vk::KhrImageFormatListFn::name().as_ptr(),
     ];
+    const VULKAN_1_2_IDX: usize = 5;
 
     /// Gets a list of extensions required to run a [`VulkanRenderer`] on the given
     /// [`PhysicalDevice`], as a `'static` slice of [`CStr`]-style pointers (i.e. null-terminated
@@ -262,11 +268,15 @@ impl VulkanRenderer {
     /// Uses [`PhysicalDevice::api_version`] to determine what is necessary to enable
     /// given the currently-in-use API version
     pub fn required_extensions(phd: &PhysicalDevice) -> &'static [*const i8] {
+        use std::ffi::CStr;
         let v = phd.api_version();
+        assert_eq!(unsafe {
+            CStr::from_ptr(Self::EXTS[Self::VULKAN_1_2_IDX])
+        }, vk::KhrImageFormatListFn::name());
         if v < Version::VERSION_1_1 {
             panic!("unsupported vulkan api version: {:?}", v);
         } else if v >= Version::VERSION_1_2 {
-            &Self::EXTS[..4]
+            &Self::EXTS[..Self::VULKAN_1_2_IDX]
         } else {
             Self::EXTS
         }
@@ -316,7 +326,7 @@ impl VulkanRenderer {
 
     fn ensure_render_setup(
         &mut self,
-        format: vk::Format
+        format: FormatMapping,
     ) -> Result<(), Error<'static>> {
         use std::collections::hash_map::Entry;
         let device = self.device.clone();
@@ -558,7 +568,7 @@ impl super::Bind<Rc<crate::backend::vulkan::Surface>> for VulkanRenderer {
                     target.handle(),
                     target.extension(),
                 )?;
-                let vk::SurfaceFormatKHR { format, color_space } = swapchain_support.choose_format()
+                let swapchain::SurfaceFormatInfo { format, color_space } = swapchain_support.choose_format()
                     .ok_or(Error::SwapchainFormat)?;
 
                 self.ensure_render_setup(format)?;
@@ -830,7 +840,12 @@ impl ImportDma for VulkanRenderer {
     }
 
     fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = DrmFormat>> {
-        let it = DerefSliceIter::new(self.dmabuf_formats.clone());
+        let it = DerefSliceIter::new(self.dmabuf_formats.clone())
+            .filter(|&DrmFormat { code, .. }| !matches!(
+                code,
+                Fourcc::Argb8888
+                | Fourcc::Abgr8888,
+            ));
         Box::new(it) as Box<_>
     }
 
@@ -843,15 +858,28 @@ impl ImportDmaWl for VulkanRenderer {}
 
 fn mem_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
     use crate::backend::allocator::vulkan::format;
-    format::known_vk_formats().filter(|&(_, vk_fmt)| matches!(
-        vk_fmt,
-        vk::Format::B8G8R8A8_SRGB
-        | vk::Format::R8G8B8A8_SRGB
-        | vk::Format::B8G8R8A8_UNORM
-        | vk::Format::R8G8B8A8_UNORM
-        | vk::Format::B8G8R8_SRGB
-        | vk::Format::R8G8B8_SRGB
-    ))
+    fn is_match(f: vk::Format) -> bool {
+        matches!(
+            f,
+            vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::R8G8B8A8_UNORM
+            | vk::Format::B8G8R8_SRGB
+            | vk::Format::R8G8B8_SRGB,
+        )
+    }
+    FORMAT_MAPPINGS.iter()
+        .flat_map(|&(drm, fm)| {
+            fm.srgb()
+                .filter(|&f| is_match(f))
+                .map(|f| (drm, f))
+                .or_else(|| if is_match(fm.format) {
+                    Some((drm, fm.format))
+                } else {
+                    None
+                })
+        })
 }
 
 impl ImportMem for VulkanRenderer {
@@ -875,9 +903,18 @@ impl ImportMem for VulkanRenderer {
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+        LOG_MEM_FORMATS.call_once(|| {
+            let shm_formats: Box<[(Fourcc, vk::Format)]> = mem_formats()
+                .collect::<Vec<_>>()
+                .into();
+            debug!(shm_formats = ?&*shm_formats, "supported shm formats");
+        });
         Box::new(mem_formats().map(|(fmt, ..)| fmt))
     }
 }
+
+use std::sync::Once;
+static LOG_MEM_FORMATS: std::sync::Once = std::sync::Once::new();
 
 type ShmCache = HashMap<usize, Arc<InnerImage>>;
 
@@ -927,7 +964,24 @@ impl ImportMemWl for VulkanRenderer {
                 let fmt = Format::try_from(shm_format)?;
                 debug!(?fmt, "found format for shm buffer");
                 let queue_family_indices = &[self.queues.graphics.index as u32];
-                let info = vk::ImageCreateInfo::builder()
+                let fmt_mapping = FORMAT_MAPPINGS.iter()
+                    .find_map(|&(drm_fmt, fm)| if drm_fmt == fmt.drm {
+                        Some(fm)
+                    } else {
+                        None
+                    })
+                    .unwrap_or_else(|| {
+                        warn!(?fmt, "no format mapping found for shm input format");
+                        FormatMapping::from(fmt.vk)
+                    });
+                assert_eq!(fmt_mapping.format, fmt.vk);
+                let view_formats = [
+                    fmt.vk,
+                    fmt_mapping.srgb().unwrap_or(vk::Format::default()),
+                ];
+                let mut view_formats_list = vk::ImageFormatListCreateInfoKHR::builder()
+                    .view_formats(&view_formats);
+                let mut info = vk::ImageCreateInfo::builder()
                     .flags(vk::ImageCreateFlags::empty())
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(fmt.vk)
@@ -944,6 +998,11 @@ impl ImportMemWl for VulkanRenderer {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .queue_family_indices(queue_family_indices)
                     .initial_layout(vk::ImageLayout::UNDEFINED);
+                if view_formats[1] != vk::Format::default() {
+                    info = info
+                        .push_next(&mut view_formats_list)
+                        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT);
+                }
                 let image = vk_create_guarded!(device, create_image(&info, None), destroy_image(None))?;
                 let reqs = unsafe { device.get_image_memory_requirements(*image) };
                 let (mem_idx, ..) = [
@@ -1306,7 +1365,7 @@ pub enum Error<'a> {
     Unimplemented(&'a str),
     /// ?
     #[error("no renderer setup found for format: {0:?}")]
-    RendererSetup(vk::Format),
+    RendererSetup(FormatMapping),
     /// an interrupt occured while waiting on a [`SyncPoint`]
     #[error("waiting for fence interrupted: {0}")]
     Interrupted(#[from] crate::backend::renderer::sync::Interrupted),

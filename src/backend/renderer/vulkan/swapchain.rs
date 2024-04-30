@@ -1,4 +1,8 @@
 use ash::vk;
+use crate::backend::allocator::vulkan::format::{
+    FormatMapping,
+    FORMAT_MAPPINGS,
+};
 use super::{
     VulkanRenderer,
     Error,
@@ -14,11 +18,29 @@ use std::{
 };
 use tracing::{debug, trace};
 
+const SUPPORTED_FORMATS: &[vk::Format] = &[
+    // vk::Format::R16G16B16A16_SFLOAT,
+    vk::Format::R8G8B8A8_SRGB,
+    // vk::Format::B8G8R8A8_SRGB,
+];
+
+fn supported_formats() -> impl Iterator<Item=FormatMapping> {
+    SUPPORTED_FORMATS.iter().copied().filter_map(|vkf| {
+        FORMAT_MAPPINGS.iter()
+            .map(|&(_, fm)| fm)
+            .find(|fm| match fm.srgb() {
+                Some(f) if f == vkf => true,
+                Some(..) => false,
+                None => vkf == fm.format,
+            })
+    })
+}
+
 pub struct Swapchain {
     device: Arc<super::Device>,
     handle: vk::SwapchainKHR,
     ext: ash::extensions::khr::Swapchain,
-    format: vk::SurfaceFormatKHR,
+    format: SurfaceFormatInfo,
     present_mode: vk::PresentModeKHR,
     extent: vk::Extent2D,
     images: Box<[SwapchainImage]>,
@@ -38,7 +60,7 @@ impl Swapchain {
         let SurfaceInfo { surface, surface_ext, color_space, capabilities, .. } = surface_info;
         let device = r.device.clone();
         let swapchain_ext = vk_ext::khr::Swapchain::new(r.instance(), &device);
-        let format = render_setup.format;
+        let format = &render_setup.format;
         let extent = capabilities.extent_or(fallback_extent);
         let present_family_idx = r.queues.present_queue(r.physical_device(), surface, surface_ext)?;
         let mut queue_family_indices: &[u32] = &[
@@ -49,11 +71,18 @@ impl Swapchain {
         if present_family_idx == r.queues.graphics.index {
             queue_family_indices = &queue_family_indices[..1];
         }
-        let create_info = vk::SwapchainCreateInfoKHR::builder()
+
+        let view_formats = [
+            format.format,
+            format.srgb().unwrap_or_default(),
+        ];
+        let mut view_format_list = vk::ImageFormatListCreateInfoKHR::builder()
+            .view_formats(&view_formats);
+        let mut create_info = vk::SwapchainCreateInfoKHR::builder()
             .flags(vk::SwapchainCreateFlagsKHR::empty())
             .surface(surface)
             .min_image_count(capabilities.image_count())
-            .image_format(format)
+            .image_format(view_formats[0])
             .image_color_space(color_space)
             .image_extent(extent)
             .image_array_layers(1)
@@ -63,6 +92,11 @@ impl Swapchain {
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(surface_info.present_mode);
+        if view_formats[1] != Default::default() {
+            create_info = create_info
+                .push_next(&mut view_format_list)
+                .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT);
+        }
         trace!("create_swapchain: {:#?}", &*create_info);
         let handle = unsafe {
             swapchain_ext.create_swapchain(&create_info, None)
@@ -132,7 +166,7 @@ impl Swapchain {
         Ok(Swapchain {
             handle: ScopeGuard::into_inner(handle),
             ext: swapchain_ext,
-            format: vk::SurfaceFormatKHR {
+            format: SurfaceFormatInfo {
                 format: render_setup.format,
                 color_space,
             },
@@ -170,13 +204,7 @@ impl Swapchain {
 
     #[allow(dead_code)]
     #[inline(always)]
-    pub fn surface_format(&self) -> &vk::SurfaceFormatKHR {
-        &self.format
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn format(&self) -> vk::Format {
+    pub fn format(&self) -> FormatMapping {
         self.format.format
     }
 
@@ -333,16 +361,18 @@ impl SupportDetails {
             present_modes,
         })
     }
-    pub fn choose_format(&self) -> Option<vk::SurfaceFormatKHR> {
-        const SUPPORTED_FORMATS: &[vk::Format] = &[
-            vk::Format::R16G16B16A16_SFLOAT,
-            vk::Format::R8G8B8A8_SRGB,
-            vk::Format::B8G8R8A8_SRGB,
-        ];
-        SUPPORTED_FORMATS.iter().find_map(|&fmt| {
+    pub fn choose_format(&self) -> Option<SurfaceFormatInfo> {
+        supported_formats().find_map(|fmt| {
+            let fmt_f = fmt.srgb()
+                .filter(|&v| v != vk::Format::default())
+                .unwrap_or(fmt.format);
             self.formats.iter()
-                .find(|&&vk::SurfaceFormatKHR { format, color_space }| format == fmt && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                .find(|&&vk::SurfaceFormatKHR { format, color_space }| format == fmt_f && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
                 .copied()
+                .map(|vk::SurfaceFormatKHR { color_space, .. }| SurfaceFormatInfo {
+                    format: fmt,
+                    color_space,
+                })
         })
     }
     pub fn choose_present_mode(&self) -> vk::PresentModeKHR {
@@ -356,6 +386,12 @@ impl SupportDetails {
             .copied()
             .unwrap_or(vk::PresentModeKHR::FIFO)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceFormatInfo {
+    pub format: FormatMapping,
+    pub color_space: vk::ColorSpaceKHR,
 }
 
 trait CapabilitiesExt {
@@ -406,7 +442,7 @@ impl SwapchainImage {
     fn new(
         device: &ash::Device,
         image: vk::Image,
-        format: vk::Format,
+        format: &FormatMapping,
         render_pass: vk::RenderPass,
         extent: &vk::Extent2D,
     ) -> Result<Self, SwapchainError<&'static str>> {
@@ -416,11 +452,14 @@ impl SwapchainImage {
             b: vk::ComponentSwizzle::IDENTITY,
             a: vk::ComponentSwizzle::IDENTITY,
         };
+        let fmt = format.srgb()
+            .filter(|&v| v != vk::Format::default())
+            .unwrap_or(format.format);
         let info = vk::ImageViewCreateInfo::builder()
             .flags(vk::ImageViewCreateFlags::empty())
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
+            .format(fmt)
             .components(IDENTITY_MAPPING)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
