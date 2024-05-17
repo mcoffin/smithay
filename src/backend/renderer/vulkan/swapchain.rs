@@ -19,9 +19,9 @@ use std::{
 use tracing::{debug, trace};
 
 const SUPPORTED_FORMATS: &[vk::Format] = &[
-    // vk::Format::R16G16B16A16_SFLOAT,
+    vk::Format::B8G8R8A8_SRGB,
     vk::Format::R8G8B8A8_SRGB,
-    // vk::Format::B8G8R8A8_SRGB,
+    vk::Format::R16G16B16A16_SFLOAT,
 ];
 
 fn supported_formats() -> impl Iterator<Item=FormatMapping> {
@@ -452,14 +452,15 @@ impl SwapchainImage {
             b: vk::ComponentSwizzle::IDENTITY,
             a: vk::ComponentSwizzle::IDENTITY,
         };
-        let fmt = format.srgb()
-            .filter(|&v| v != vk::Format::default())
-            .unwrap_or(format.format);
+        // let fmt = format.srgb()
+        //     .filter(|&v| v != vk::Format::default())
+        //     .unwrap_or(format.format);
         let info = vk::ImageViewCreateInfo::builder()
             .flags(vk::ImageViewCreateFlags::empty())
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(fmt)
+            // .format(fmt)
+            .format(format.format)
             .components(IDENTITY_MAPPING)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -467,7 +468,9 @@ impl SwapchainImage {
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            });
+            })
+            .build();
+        debug!(create_info = ?info, "creating image view");
         let image_view = unsafe {
             device.create_image_view(&info, None)
         }

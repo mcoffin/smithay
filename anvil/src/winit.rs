@@ -12,7 +12,6 @@ use smithay::{
     backend::{allocator::Fourcc, renderer::ImportMem},
     reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle},
 };
-use tracing::debug;
 
 use smithay::{
     backend::{
@@ -53,7 +52,7 @@ use smithay::{
 };
 #[cfg(feature = "renderer_vulkan")]
 use smithay::backend::winit::WinitVulkanGraphics;
-use tracing::{error, info, warn};
+use tracing::*;
 
 use crate::state::{post_repaint, take_presentation_feedback, AnvilState, Backend};
 use crate::{drawing::*, render::*};
@@ -253,7 +252,7 @@ where
 
     while state.running.load(Ordering::SeqCst) {
         let status = winit.dispatch_new_events(|event| {
-            debug!(?event, "got winit event");
+            trace!(?event, "got winit event");
             match event {
                 WinitEvent::Resized { size, .. } => {
                     // We only have one output
