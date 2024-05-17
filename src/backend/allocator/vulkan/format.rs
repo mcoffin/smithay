@@ -154,23 +154,29 @@ vk_format_table! {
     Xbgr16161616f => R16G16B16A16_SFLOAT,
 }
 
-pub(crate) fn known_vk_formats() -> impl Iterator<Item = (Fourcc, vk::Format)> {
-    known_formats()
-        .iter()
-        .filter_map(|&f| get_vk_format(f).map(move |vk| (f, vk)))
+pub(crate) fn known_vk_formats() -> impl Iterator<Item = (Fourcc, FormatMapping)> {
+    FORMAT_MAPPINGS.iter().copied()
 }
 
 pub(crate) trait FormatExt {
-    fn has_alpha(self) -> bool;
+    fn has_alpha(&self) -> bool;
 }
 
 impl FormatExt for vk::Format {
-    fn has_alpha(self) -> bool {
+    fn has_alpha(&self) -> bool {
         !matches!(
-            self,
+            *self,
             vk::Format::B8G8R8_SRGB
+            | vk::Format::B8G8R8_UNORM
             | vk::Format::R8G8B8_SRGB
+            | vk::Format::R8G8B8_UNORM
         )
+    }
+}
+
+impl FormatExt for FormatMapping {
+    fn has_alpha(&self) -> bool {
+        self.format.has_alpha() || self.srgb().map_or(false, |f| f.has_alpha())
     }
 }
 

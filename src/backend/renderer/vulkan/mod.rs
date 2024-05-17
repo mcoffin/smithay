@@ -304,7 +304,7 @@ impl VulkanRenderer {
                 .iter()
                 .find(|v| modifier == v.drm_format_modifier)
                 .map(|mod_props| Format {
-                    vk: info.vk,
+                    vulkan: info.vk,
                     drm: code,
                     modifier: Some(*mod_props),
                 })
@@ -662,7 +662,7 @@ impl ImportDma for VulkanRenderer {
         };
         let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::builder().handle_type(H_TYPE);
         let mut info = vk::PhysicalDeviceImageFormatInfo2::builder()
-            .format(fmt.vk)
+            .format(fmt.vk())
             .ty(vk::ImageType::TYPE_2D)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
             .usage(imported_usage_flags())
@@ -696,11 +696,17 @@ impl ImportDma for VulkanRenderer {
         let mut plane_layouts: Vec<vk::SubresourceLayout>;
         let mut external_info = vk::ExternalMemoryImageCreateInfo::builder().handle_types(H_TYPE);
         let extent @ vk::Extent3D { width, height, .. } = dmabuf.extent_3d();
+        let view_formats = [
+            fmt.vk(),
+            fmt.vulkan.srgb().unwrap_or_default()
+        ];
+        let mut view_format_list = vk::ImageFormatListCreateInfoKHR::builder()
+            .view_formats(&view_formats);
         let mut info = vk::ImageCreateInfo::builder()
             .push_next(&mut external_info)
             .flags(image_create_flags)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(fmt.vk)
+            .format(fmt.vk())
             .extent(extent)
             .mip_levels(1)
             .array_layers(1)
@@ -710,6 +716,11 @@ impl ImportDma for VulkanRenderer {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .queue_family_indices(queue_indices.as_slice())
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        if view_formats[1] != vk::Format::default() {
+            info = info
+                .push_next(&mut view_format_list)
+                .flags(image_create_flags | vk::ImageCreateFlags::MUTABLE_FORMAT);
+        }
         if let Some(mod_info) = fmt.modifier.as_ref() {
             plane_layouts = Vec::with_capacity(dmabuf.num_planes());
             let it = dmabuf
@@ -840,12 +851,13 @@ impl ImportDma for VulkanRenderer {
     }
 
     fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = DrmFormat>> {
-        let it = DerefSliceIter::new(self.dmabuf_formats.clone())
-            .filter(|&DrmFormat { code, .. }| !matches!(
-                code,
-                Fourcc::Argb8888
-                | Fourcc::Abgr8888,
-            ));
+        let it = DerefSliceIter::new(self.dmabuf_formats.clone());
+        // let it = DerefSliceIter::new(self.dmabuf_formats.clone())
+        //     .filter(|&DrmFormat { code, .. }| !matches!(
+        //         code,
+        //         Fourcc::Argb8888
+        //         | Fourcc::Abgr8888,
+        //     ));
         Box::new(it) as Box<_>
     }
 
@@ -913,7 +925,6 @@ impl ImportMem for VulkanRenderer {
     }
 }
 
-use std::sync::Once;
 static LOG_MEM_FORMATS: std::sync::Once = std::sync::Once::new();
 
 type ShmCache = HashMap<usize, Arc<InnerImage>>;
@@ -972,11 +983,11 @@ impl ImportMemWl for VulkanRenderer {
                     })
                     .unwrap_or_else(|| {
                         warn!(?fmt, "no format mapping found for shm input format");
-                        FormatMapping::from(fmt.vk)
+                        FormatMapping::from(fmt.vk())
                     });
-                assert_eq!(fmt_mapping.format, fmt.vk);
+                assert_eq!(fmt_mapping.format, fmt.vk());
                 let view_formats = [
-                    fmt.vk,
+                    fmt.vk(),
                     fmt_mapping.srgb().unwrap_or(vk::Format::default()),
                 ];
                 let mut view_formats_list = vk::ImageFormatListCreateInfoKHR::builder()
@@ -984,7 +995,7 @@ impl ImportMemWl for VulkanRenderer {
                 let mut info = vk::ImageCreateInfo::builder()
                     .flags(vk::ImageCreateFlags::empty())
                     .image_type(vk::ImageType::TYPE_2D)
-                    .format(fmt.vk)
+                    .format(fmt.vk())
                     .extent(vk::Extent3D {
                         width: width as _,
                         height: height as _,
@@ -1195,7 +1206,7 @@ impl InnerImage {
     #[inline]
     fn has_alpha(&self) -> bool {
         use crate::backend::allocator::vulkan::format::FormatExt;
-        self.format.vk.has_alpha()
+        self.format.vulkan.has_alpha()
     }
 
     /// TODO: honestly we *probably* know when this is going to happen, so wouldn't have to key off
@@ -1373,6 +1384,8 @@ pub enum Error<'a> {
     /// the buffer's memory
     #[error(transparent)]
     BufferAccess(#[from] crate::wayland::shm::BufferAccessError),
+    #[error(transparent)]
+    InvalidFrameState(frame::FrameStateError<'a>),
 }
 
 impl<'a> Error<'a> {
@@ -1438,6 +1451,17 @@ trait DeviceExt {
         pool: vk::CommandPool,
         level: vk::CommandBufferLevel,
     ) -> Result<vk::CommandBuffer, Error<'static>>;
+
+    /// Version of [`ash::Device::free_command_buffers`] that first checks for the case where `cbs`
+    /// is empty
+    ///
+    /// In `debug` configurations, it will also ensure that none of the elements of `cbs` contain a
+    /// `null` [`vk::CommandBuffer`] handle
+    unsafe fn free_command_buffers_safe(
+        &self,
+        pool: vk::CommandPool,
+        cbs: &[vk::CommandBuffer],
+    );
 }
 impl DeviceExt for ash::Device {
     fn memory_requirements(&self, image: vk::Image) -> vk::MemoryRequirements2 {
@@ -1508,6 +1532,20 @@ impl DeviceExt for ash::Device {
                     context: "vkAllocateCommandBuffers",
                     result: e,
                 }),
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn free_command_buffers_safe(
+        &self,
+        pool: vk::CommandPool,
+        cbs: &[vk::CommandBuffer],
+    ) {
+        if !cbs.is_empty() {
+            debug_assert!(!cbs.contains(&vk::CommandBuffer::null()));
+            unsafe {
+                self.free_command_buffers(pool, cbs);
             }
         }
     }

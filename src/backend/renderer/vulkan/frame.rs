@@ -2,6 +2,7 @@ use ash::vk;
 use cgmath::Matrix4;
 use crate::vk_call;
 use super::*;
+use std::fmt;
 
 /// [`Frame`] implementation used by a [`VulkanRenderer`]
 ///
@@ -12,6 +13,7 @@ pub struct VulkanFrame<'a> {
     target: &'a VulkanTarget,
     setup: &'a RenderSetup,
     command_buffer: vk::CommandBuffer,
+    clear_command_buffer: vk::CommandBuffer,
     image: vk::Image,
     image_idx: u32,
     image_ready: [vk::Semaphore; 2],
@@ -20,6 +22,41 @@ pub struct VulkanFrame<'a> {
     output_size: Size<i32, Physical>,
     bound_pipeline: (vk::Pipeline, vk::PipelineLayout),
     transform_box: Matrix4<f32>,
+    operation_idx: usize,
+}
+
+impl<'a> VulkanFrame<'a> {
+    #[inline(always)]
+    fn command_buffers(&self) -> impl Iterator<Item=vk::CommandBuffer> {
+        [
+            self.command_buffer,
+            self.clear_command_buffer,
+        ].into_iter()
+            .filter(|cb| !cb.is_null())
+    }
+
+    unsafe fn destroy_command_buffers(&mut self) {
+        const CB_NULL: vk::CommandBuffer = vk::CommandBuffer::null();
+        let mut cb_count = 0usize;
+        let mut cbs = [CB_NULL; 2];
+        self.command_buffers()
+            .zip(cbs.iter_mut())
+            .for_each(|(cb, out)| {
+                *out = cb;
+                cb_count += 1;
+            });
+        self.device().free_command_buffers_safe(*self.renderer.command_pool, &cbs[..cb_count]);
+
+        self.command_buffer = CB_NULL;
+        self.clear_command_buffer = CB_NULL;
+    }
+
+    #[inline(always)]
+    fn image_ready_semaphores(&self) -> impl Iterator<Item=vk::Semaphore> + '_ {
+        self.image_ready.iter()
+            .copied()
+            .filter(|v| !v.is_null())
+    }
 }
 
 impl<'a> Drop for VulkanFrame<'a> {
@@ -35,15 +72,12 @@ impl<'a> Drop for VulkanFrame<'a> {
             if !self.submit_fence.is_null() {
                 device.destroy_fence(self.submit_fence, None);
             }
-            self.image_ready.iter()
-                .copied()
-                .filter(|v| !v.is_null())
+            self.image_ready_semaphores()
                 .for_each(|semaphore| {
                     device.destroy_semaphore(semaphore, None);
                 });
-            if self.command_buffer != vk::CommandBuffer::null() {
-                device.free_command_buffers(*self.renderer.command_pool, &[self.command_buffer]);
-            }
+
+            self.destroy_command_buffers();
         }
     }
 }
@@ -67,16 +101,16 @@ impl<'a> VulkanFrame<'a> {
     }
     unsafe fn push_constants(&self, data: &UniformData) {
         use mem::offset_of;
-        let device = self.renderer.device();
-        device.push_constant(
+        self.device().push_constant(
             self.command_buffer,
             self.bound_pipeline.1,
             vk::ShaderStageFlags::VERTEX,
             0, &data.vert
         );
         const FRAG_OFFSET: usize = offset_of!(UniformData, frag);
+        // offset as set in the shader source
         debug_assert_eq!(FRAG_OFFSET, 80);
-        device.push_constant(
+        self.device().push_constant(
             self.command_buffer,
             self.bound_pipeline.1,
             vk::ShaderStageFlags::FRAGMENT,
@@ -126,6 +160,104 @@ impl<'a> VulkanFrame<'a> {
             }]
         );
     }
+
+    fn clear_full(
+        &mut self,
+        color: &[f32; 4],
+        old_access_mask: vk::AccessFlags,
+        old_layout: vk::ImageLayout,
+    ) -> Result<(), <Self as Frame>::Error> {
+        #[inline(always)]
+        fn swap_layouts(b: &mut vk::ImageMemoryBarrier) {
+            use std::mem;
+            mem::swap(&mut b.src_access_mask, &mut b.dst_access_mask);
+            mem::swap(&mut b.old_layout, &mut b.new_layout);
+        }
+
+        let device = self.renderer.device();
+
+        debug_assert_eq!(self.operation_idx, 0);
+        debug_assert!(self.clear_command_buffer.is_null());
+        debug_assert!(self.image_ready[1].is_null());
+
+        let cmd_pool = *self.renderer.command_pool;
+        self.clear_command_buffer = device.create_single_command_buffer(cmd_pool, vk::CommandBufferLevel::PRIMARY)?;
+        self.image_ready = [
+            vk_call!(device, create_semaphore(&vk::SemaphoreCreateInfo::default(), None))?,
+            self.image_ready[0]
+        ];
+
+        vk_call!(device, begin_command_buffer(
+            self.clear_command_buffer,
+            &vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        ))?;
+
+        let mut barriers = [
+            vk::ImageMemoryBarrier {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access_mask: old_access_mask,
+                dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                old_layout,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: self.image,
+                subresource_range: super::COLOR_SINGLE_LAYER,
+            },
+        ];
+        unsafe {
+            device.cmd_pipeline_barrier(
+                self.clear_command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &barriers,
+            );
+            device.cmd_clear_color_image(
+                self.clear_command_buffer,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue {
+                    float32: *color,
+                },
+                &[super::COLOR_SINGLE_LAYER],
+            );
+            swap_layouts(&mut barriers[0]);
+            device.cmd_pipeline_barrier(
+                self.clear_command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &barriers,
+            );
+        }
+        vk_call!(device, end_command_buffer(self.clear_command_buffer));
+
+        let submit_wait_sems = if self.image_ready[1] == vk::Semaphore::null() {
+            &[]
+        } else {
+            &self.image_ready[1..2]
+        };
+        let submit_buffers = [self.clear_command_buffer];
+        let submit_info = vk::SubmitInfo::builder()
+            .wait_semaphores(submit_wait_sems)
+            .command_buffers(&submit_buffers)
+            .signal_semaphores(&self.image_ready[..1]);
+        vk_call!(device, queue_submit(
+            self.renderer.queues.graphics.handle,
+            &[submit_info.build()],
+            vk::Fence::null()
+        ));
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn device(&self) -> &ash::Device {
+        self.renderer.device()
+    }
 }
 
 impl<'a> Frame for VulkanFrame<'a> {
@@ -149,6 +281,15 @@ impl<'a> Frame for VulkanFrame<'a> {
                 rect,
                 ..DEFAULT_CLEAR_RECT
             }
+        }
+        #[cfg(feature = "renderer_vulkan_full_clear")]
+        if self.operation_idx == 0
+            && at.len() == 1
+            && matches!(&at[0].loc, crate::utils::Point { x: 0, y: 0, .. })
+            && at[0].size == self.output_size {
+            let attached_access = vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_READ;
+            return self.clear_full(&color, attached_access, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
         let cb = self.command_buffer;
         let device = self.renderer.device();
@@ -215,6 +356,7 @@ impl<'a> Frame for VulkanFrame<'a> {
             self.rect_viewport(&dst);
             self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
         }
+        self.operation_idx += 1;
         Ok(())
     }
     #[tracing::instrument(skip(self, _damage, texture))]
@@ -271,11 +413,14 @@ impl<'a> Frame for VulkanFrame<'a> {
             self.rect_viewport(&dst);
             self.renderer.device().cmd_draw(self.command_buffer, 4, 2, 0, 0);
         }
+        self.operation_idx += 1;
         Ok(())
     }
     fn transformation(&self) -> Transform {
         Transform::Normal
     }
+
+    #[allow(irrefutable_let_patterns)]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         let cb = self.command_buffer;
         let device = self.renderer.device();
@@ -490,6 +635,7 @@ pub(super) fn render_internal(
         target,
         setup,
         command_buffer: ScopeGuard::into_inner(command_buffer),
+        clear_command_buffer: vk::CommandBuffer::null(),
         image,
         image_idx,
         image_ready: [
@@ -501,6 +647,7 @@ pub(super) fn render_internal(
         output_size,
         bound_pipeline: (vk::Pipeline::null(), vk::PipelineLayout::null()),
         transform_box: transform::MAT4_MODEL_BOX,
+        operation_idx: 0,
     };
     let cb = ret.command_buffer;
     let begin_info = vk::RenderPassBeginInfo::builder()
@@ -629,5 +776,28 @@ impl<T> Deref for MaybeOwned<T> {
             MaybeOwned::Borrowed(v) => v,
             MaybeOwned::Owned(v) => v,
         }
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct FrameStateError<'a>(Option<&'a str>);
+
+impl<'a> fmt::Display for FrameStateError<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const PREFIX: &str = "invalid frame state";
+        match self.0 {
+            Some(s) => write!(f, "{}: {}", PREFIX, s),
+            None => f.write_str(PREFIX),
+        }
+    }
+}
+
+impl<'a> std::error::Error for FrameStateError<'a> {}
+
+impl<'a> From<frame::FrameStateError<'a>> for Error<'a> {
+    #[inline(always)]
+    fn from(e: frame::FrameStateError<'a>) -> Self {
+        Error::InvalidFrameState(e)
     }
 }

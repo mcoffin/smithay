@@ -19,9 +19,9 @@ use std::{
 use tracing::{debug, trace};
 
 const SUPPORTED_FORMATS: &[vk::Format] = &[
-    // vk::Format::R16G16B16A16_SFLOAT,
     vk::Format::R8G8B8A8_SRGB,
     // vk::Format::B8G8R8A8_SRGB,
+    // vk::Format::R16G16B16A16_SFLOAT,
 ];
 
 fn supported_formats() -> impl Iterator<Item=FormatMapping> {

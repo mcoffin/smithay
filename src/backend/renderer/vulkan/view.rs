@@ -20,7 +20,7 @@ impl InnerImageView {
         let info = vk::ImageViewCreateInfo::builder()
             .image(image.image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(image.format.vk)
+            .format(image.format.vk())
             .components(vk::ComponentMapping {
                 r: vk::ComponentSwizzle::IDENTITY,
                 g: vk::ComponentSwizzle::IDENTITY,
