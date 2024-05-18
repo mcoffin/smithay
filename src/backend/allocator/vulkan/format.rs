@@ -82,10 +82,7 @@ impl FormatMapping {
             format_srgb: NonZeroI32::new(format_srgb.as_raw()),
         }
     }
-    #[inline(always)]
-    pub const fn has_srgb(&self) -> bool {
-        self.format_srgb.is_some()
-    }
+
     #[inline(always)]
     pub const fn srgb(&self) -> Option<vk::Format> {
         match self.format_srgb {
@@ -93,6 +90,7 @@ impl FormatMapping {
             None => None
         }
     }
+
     #[inline(always)]
     pub fn srgb_or_default(&self) -> vk::Format {
         self.srgb()

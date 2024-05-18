@@ -59,6 +59,7 @@ use std::{
 use tracing::{debug, error, trace, warn};
 
 mod buffer;
+mod color;
 mod dmabuf;
 mod fence;
 mod format;

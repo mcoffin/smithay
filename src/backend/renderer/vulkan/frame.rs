@@ -2,6 +2,7 @@ use ash::vk;
 use cgmath::Matrix4;
 use crate::vk_call;
 use super::*;
+use super::color::LinearColor;
 
 /// [`Frame`] implementation used by a [`VulkanRenderer`]
 ///
@@ -136,6 +137,11 @@ impl<'a> Frame for VulkanFrame<'a> {
         self.renderer.id()
     }
     fn clear(&mut self, color: [f32; 4], at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        let clear_color = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: LinearColor::from_srgb_premultiplied(&color).0,
+            },
+        };
         const DEFAULT_CLEAR_RECT: vk::ClearRect = vk::ClearRect {
             rect: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -152,11 +158,6 @@ impl<'a> Frame for VulkanFrame<'a> {
         }
         let cb = self.command_buffer;
         let device = self.renderer.device();
-        let clear_color = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: color,
-            },
-        };
         let clear_attachments = [
             vk::ClearAttachment {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -206,7 +207,7 @@ impl<'a> Frame for VulkanFrame<'a> {
                 tex_extent: Vector2::new(1f32, 1f32),
             },
             frag: UniformDataFrag {
-                color,
+                color: LinearColor::from_srgb_premultiplied(&color).0,
             },
         };
         trace!(?data.vert, "pushing constants");
