@@ -84,6 +84,11 @@ impl FormatMapping {
     }
 
     #[inline(always)]
+    pub const fn has_srgb(&self) -> bool {
+        self.format_srgb.is_some()
+    }
+
+    #[inline(always)]
     pub const fn srgb(&self) -> Option<vk::Format> {
         match self.format_srgb {
             Some(v) => Some(vk::Format::from_raw(v.get())),

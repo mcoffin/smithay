@@ -8,8 +8,11 @@ use crate::backend::allocator::vulkan::format::{
     FORMAT_MAPPINGS,
 };
 use super::{
-    shaders::SOURCES as SHADERS,
-    shaders::ShaderModule,
+    shaders::{
+        SOURCES as SHADERS,
+        ShaderModule,
+        ColorTransform,
+    },
     Error,
     ErrorExt,
 };
@@ -70,6 +73,32 @@ static PUSH_CONSTANT_RANGES: [vk::PushConstantRange; 2] = [
     },
 ];
 
+const fn spec_map_entry<T: Sized>(
+    constant_id: usize,
+    offset: usize
+) -> vk::SpecializationMapEntry {
+    vk::SpecializationMapEntry {
+        constant_id: constant_id as _,
+        offset: offset as _,
+        size: size_of::<T>(),
+    }
+}
+
+trait FormatMappingExt {
+    fn color_transform(&self) -> ColorTransform;
+}
+
+impl FormatMappingExt for FormatMapping {
+    #[inline]
+    fn color_transform(&self) -> ColorTransform {
+        if self.has_srgb() {
+            ColorTransform::GammaToLinear
+        } else {
+            ColorTransform::Identity
+        }
+    }
+}
+
 impl RenderSetup {
     pub fn new(
         device: Arc<super::Device>,
@@ -112,10 +141,19 @@ impl RenderSetup {
                 .build(),
         ];
         let frag_module_tex = create_shader_module(SHADERS.frag.texture)?;
+        // TODO: derive from format
+        let specialization = spec_map_entry::<ColorTransform>(0, 0);
+        let specialization = vk::SpecializationInfo {
+            map_entry_count: 1,
+            p_map_entries: (&specialization as *const vk::SpecializationMapEntry).cast(),
+            data_size: size_of::<ColorTransform>(),
+            p_data: (&color_format.color_transform() as *const ColorTransform).cast(),
+        };
         let tex_shader_stages = [
             quad_shader_stages[0],
             vk::PipelineShaderStageCreateInfo {
                 module: frag_module_tex.handle(),
+                p_specialization_info: (&specialization as *const vk::SpecializationInfo).cast(),
                 ..quad_shader_stages[1]
             },
         ];
@@ -185,9 +223,7 @@ impl RenderSetup {
                 .color_attachments(&color_attachments)
                 .build(),
         ];
-        let fmt = color_format.srgb()
-            .filter(|&v| v != vk::Format::default())
-            .unwrap_or(color_format.format);
+        let fmt = color_format.srgb_or_default();
         let color_attachments = [
             color_attachment(
                 fmt,

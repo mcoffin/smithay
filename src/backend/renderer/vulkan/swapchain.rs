@@ -364,9 +364,9 @@ impl SupportDetails {
     }
     pub fn choose_format(&self) -> Option<SurfaceFormatInfo> {
         supported_formats().find_map(|fmt| {
-            let fmt_f = fmt.format;
+            let fmts = [fmt.format, fmt.srgb_or_default()];
             self.formats.iter()
-                .find(|&&vk::SurfaceFormatKHR { format, color_space }| format == fmt_f && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                .find(|&&vk::SurfaceFormatKHR { format, color_space }| fmts.contains(&format) && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
                 .copied()
                 .map(|vk::SurfaceFormatKHR { color_space, .. }| SurfaceFormatInfo {
                     format: fmt,

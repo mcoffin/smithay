@@ -94,3 +94,10 @@ impl<'a> Deref for ShaderModule<'a> {
         &self.handle
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ColorTransform {
+    Identity = 0,
+    GammaToLinear = 1,
+}
