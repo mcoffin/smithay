@@ -393,7 +393,7 @@ const fn color_attachment(
 ) -> vk::AttachmentDescription {
     vk::AttachmentDescription {
         flags: vk::AttachmentDescriptionFlags::empty(),
-        format: format,
+        format,
         samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::LOAD,
         store_op: vk::AttachmentStoreOp::STORE,

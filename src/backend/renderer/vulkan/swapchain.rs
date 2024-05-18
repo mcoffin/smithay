@@ -83,7 +83,8 @@ impl Swapchain {
             .flags(vk::SwapchainCreateFlagsKHR::empty())
             .surface(surface)
             .min_image_count(capabilities.image_count())
-            .image_format(format.format)
+            // .image_format(format.format)
+            .image_format(format.srgb_or_default())
             .image_color_space(color_space)
             .image_extent(extent)
             .image_array_layers(1)
@@ -451,13 +452,11 @@ impl SwapchainImage {
             b: vk::ComponentSwizzle::IDENTITY,
             a: vk::ComponentSwizzle::IDENTITY,
         };
-        let fmt = format.srgb_or_default();
         let info = vk::ImageViewCreateInfo::builder()
             .flags(vk::ImageViewCreateFlags::empty())
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(fmt)
-            // .format(format.format)
+            .format(format.srgb_or_default())
             .components(IDENTITY_MAPPING)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
