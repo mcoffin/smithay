@@ -19,6 +19,7 @@ use std::{
 use tracing::{debug, trace};
 
 const SUPPORTED_FORMATS: &[vk::Format] = &[
+    #[cfg(not(feature = "vulkan_blacklist_ar24"))]
     vk::Format::B8G8R8A8_SRGB,
     vk::Format::R8G8B8A8_SRGB,
     vk::Format::R16G16B16A16_SFLOAT,
@@ -82,7 +83,7 @@ impl Swapchain {
             .flags(vk::SwapchainCreateFlagsKHR::empty())
             .surface(surface)
             .min_image_count(capabilities.image_count())
-            .image_format(view_formats[0])
+            .image_format(format.format)
             .image_color_space(color_space)
             .image_extent(extent)
             .image_array_layers(1)
@@ -363,9 +364,7 @@ impl SupportDetails {
     }
     pub fn choose_format(&self) -> Option<SurfaceFormatInfo> {
         supported_formats().find_map(|fmt| {
-            let fmt_f = fmt.srgb()
-                .filter(|&v| v != vk::Format::default())
-                .unwrap_or(fmt.format);
+            let fmt_f = fmt.format;
             self.formats.iter()
                 .find(|&&vk::SurfaceFormatKHR { format, color_space }| format == fmt_f && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
                 .copied()
@@ -452,15 +451,13 @@ impl SwapchainImage {
             b: vk::ComponentSwizzle::IDENTITY,
             a: vk::ComponentSwizzle::IDENTITY,
         };
-        // let fmt = format.srgb()
-        //     .filter(|&v| v != vk::Format::default())
-        //     .unwrap_or(format.format);
+        let fmt = format.srgb_or_default();
         let info = vk::ImageViewCreateInfo::builder()
             .flags(vk::ImageViewCreateFlags::empty())
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            // .format(fmt)
-            .format(format.format)
+            .format(fmt)
+            // .format(format.format)
             .components(IDENTITY_MAPPING)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,

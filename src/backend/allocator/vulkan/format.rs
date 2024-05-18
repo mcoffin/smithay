@@ -93,6 +93,12 @@ impl FormatMapping {
             None => None
         }
     }
+    #[inline(always)]
+    pub fn srgb_or_default(&self) -> vk::Format {
+        self.srgb()
+            .filter(|&v| v != vk::Format::default())
+            .unwrap_or(self.format)
+    }
 }
 
 impl From<vk::Format> for FormatMapping {

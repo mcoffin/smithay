@@ -840,12 +840,15 @@ impl ImportDma for VulkanRenderer {
     }
 
     fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = DrmFormat>> {
+        #[cfg(feature = "vulkan_blacklist_ar24")]
+        let it = DerefSliceIter::new(self.dmabuf_formats.clone())
+            .filter(|&DrmFormat { code, .. }| !matches!(
+                code,
+                Fourcc::Argb8888
+                | Fourcc::Abgr8888,
+            ));
+        #[cfg(not(feature = "vulkan_blacklist_ar24"))]
         let it = DerefSliceIter::new(self.dmabuf_formats.clone());
-            // .filter(|&DrmFormat { code, .. }| !matches!(
-            //     code,
-            //     Fourcc::Argb8888
-            //     | Fourcc::Abgr8888,
-            // ));
         Box::new(it) as Box<_>
     }
 

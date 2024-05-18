@@ -164,7 +164,7 @@ impl RenderSetup {
             .alpha_to_one_enable(false)
             .build();
         static COLOR_BLEND_ATTACHMENTS: &[vk::PipelineColorBlendAttachmentState] = &[
-            color_blend_attachment(true),
+            color_blend_attachment(true, true),
         ];
         let blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
             .logic_op_enable(false)
@@ -315,8 +315,9 @@ fn usage_flags_always() -> vk::ImageUsageFlags {
     | vk::ImageUsageFlags::TRANSFER_DST
 }
 
-const fn color_blend_attachment(premultiplied: bool) -> vk::PipelineColorBlendAttachmentState {
-    const PREMULTIPLIED: vk::PipelineColorBlendAttachmentState = vk::PipelineColorBlendAttachmentState {
+const fn color_blend_attachment(blend_enabled: bool, premultiplied: bool) -> vk::PipelineColorBlendAttachmentState {
+    type AttState = vk::PipelineColorBlendAttachmentState;
+    const PREMULTIPLIED: AttState = AttState {
         blend_enable: vk::TRUE,
         src_color_blend_factor: vk::BlendFactor::ONE,
         dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
@@ -326,16 +327,26 @@ const fn color_blend_attachment(premultiplied: bool) -> vk::PipelineColorBlendAt
         alpha_blend_op: vk::BlendOp::ADD,
         color_write_mask: vk::ColorComponentFlags::RGBA,
     };
-    if premultiplied {
-        PREMULTIPLIED
-    } else {
-        vk::PipelineColorBlendAttachmentState {
+    const COLOR_BLEND_ATTACHMENT_OPAQUE: AttState = AttState {
+        blend_enable: vk::FALSE,
+        src_color_blend_factor: vk::BlendFactor::ONE,
+        dst_color_blend_factor: vk::BlendFactor::ZERO,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::RGBA,
+    };
+    match (blend_enabled, premultiplied) {
+        (false, ..) => COLOR_BLEND_ATTACHMENT_OPAQUE,
+        (true, true) => PREMULTIPLIED,
+        (true, false) => AttState {
             src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
             dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             src_alpha_blend_factor: vk::BlendFactor::ONE,
             dst_alpha_blend_factor: vk::BlendFactor::ZERO,
             ..PREMULTIPLIED
-        }
+        },
     }
 }
 

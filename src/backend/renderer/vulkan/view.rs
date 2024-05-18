@@ -6,6 +6,7 @@ use super::{
     ErrorExt,
     InnerImage,
 };
+use tracing::*;
 
 #[derive(Debug)]
 pub struct InnerImageView {
@@ -15,6 +16,7 @@ pub struct InnerImageView {
 }
 
 impl InnerImageView {
+    #[tracing::instrument(skip(image, max))]
     pub fn new(image: &InnerImage, layout: &render_pass::PipelineLayout, max: u32) -> Result<Self, Error<'static>> {
         let device = image.device.upgrade().unwrap();
         let info = vk::ImageViewCreateInfo::builder()
@@ -48,6 +50,7 @@ impl InnerImageView {
         }).map(|v| scopeguard::guard(v, |mut v| unsafe {
             v.destroy(&device);
         }))?;
+        debug!(create_info = ?info.build(), "created client image view");
 
         let pool_sizes = &[
             vk::DescriptorPoolSize {
