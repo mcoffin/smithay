@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)]
 use std::{os::unix::io::OwnedFd, sync::Arc};
 
 use ::winit::platform::pump_events::PumpStatus;
