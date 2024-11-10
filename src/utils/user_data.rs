@@ -6,6 +6,8 @@ use std::any::Any;
 use std::mem::ManuallyDrop;
 use std::thread::{self, ThreadId};
 
+use tracing::*;
+
 use self::list::AppendList;
 
 // `UserData.get()` is called frequently, and unfortunately
@@ -100,6 +102,8 @@ impl Drop for UserData {
                 unsafe {
                     ManuallyDrop::drop(&mut **val);
                 }
+            } else {
+                warn!("leaking value as it is being dropped from a non-originating thread: {:?}", &**val);
             }
         }
     }
