@@ -21,7 +21,6 @@ members = [
     "smithay-drm-extras",
     "smallvil",
     "anvil",
-    "wlcs_anvil",
     "test_clients",
 ]
 

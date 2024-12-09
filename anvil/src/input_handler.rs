@@ -1296,7 +1296,7 @@ enum KeyAction {
 }
 
 fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
-    if modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace || modifiers.logo && keysym == Keysym::q
+    if modifiers.ctrl && modifiers.has_meta() && keysym == Keysym::BackSpace || modifiers.has_meta() && keysym == Keysym::q
     {
         // ctrl+alt+backspace = quit
         // logo + q = quit
@@ -1306,24 +1306,40 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::VtSwitch(
             (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32,
         ))
-    } else if modifiers.logo && keysym == Keysym::Return {
+    } else if modifiers.has_meta() && keysym == Keysym::Return {
         // run terminal
         Some(KeyAction::Run("weston-terminal".into()))
-    } else if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
+    } else if modifiers.has_meta() && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
         Some(KeyAction::Screen((keysym.raw() - xkb::KEY_1) as usize))
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::M {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::M {
         Some(KeyAction::ScaleDown)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::P {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::P {
         Some(KeyAction::ScaleUp)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::W {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::W {
         Some(KeyAction::TogglePreview)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::R {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::R {
         Some(KeyAction::RotateOutput)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::T {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::T {
         Some(KeyAction::ToggleTint)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
+    } else if modifiers.has_meta() && modifiers.shift && keysym == Keysym::D {
         Some(KeyAction::ToggleDecorations)
     } else {
         None
+    }
+}
+
+trait ModifiersExt {
+    fn has_meta(&self) -> bool;
+}
+impl ModifiersExt for ModifiersState {
+    #[cfg(feature = "meta_key_alt")]
+    #[inline(always)]
+    fn has_meta(&self) -> bool {
+        self.alt
+    }
+    #[cfg(not(feature = "meta_key_alt"))]
+    #[inline(always)]
+    fn has_meta(&self) -> bool {
+        self.logo
     }
 }
